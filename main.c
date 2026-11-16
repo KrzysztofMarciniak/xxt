@@ -359,6 +359,10 @@ static int special_key(KeySym key, char *buf) {
 }
 
 int main(void) {
+  int fd;
+  for (fd = 0; fd < 3; ++fd)
+    if (fcntl(fd, F_GETFD) == -1)
+      open("/dev/null", O_RDWR);
   int master, slave, n, xfd, i, width, height;
   pid_t child;
   char *name, buf[4096];

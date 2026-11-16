@@ -6,7 +6,7 @@ config:
 	#define FG_COLOR "#ffffff" // white
 
 compile:
-	cc -std=c89 -o xxt main.c -lX11
+	cc -std=c89 -o xxt main.c -lX11 -O2
 
 install:
 	install -m 755 xxt /usr/local/bin/xxt
@@ -15,19 +15,16 @@ deps:
 	libX11. POSIX PTY functions come from libc on glibc.
 
 size:
-	cloc result:
-		github.com/AlDanial/cloc v 2.08  T=0.01 s (104.8 files/s, 55875.1 lines/s)
-		-------------------------------------------------------------------------------
-		Language                     files          blank        comment           code
-		-------------------------------------------------------------------------------
-		C                                1            122              3            408
-		-------------------------------------------------------------------------------
-
-size result
-	text    data     bss     dec     hex filename
-   	9657     928     192   10777    2a19 ./xxt
+	github.com/AlDanial/cloc v 2.08  T=0.01 s (105.8 files/s, 57579.5 lines/s)
+	-------------------------------------------------------------------------------
+	Language                     files          blank        comment           code
+	-------------------------------------------------------------------------------
+	C                                1            120              3            421
+	-------------------------------------------------------------------------------
 
 
+   	text    data     bss     dec     hex filename
+   	9739     936     192   10867    2a73 ./xxt
 
 info:
 
