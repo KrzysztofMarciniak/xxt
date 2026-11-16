@@ -1,0 +1,41 @@
+xxt is an extremely small X11 terminal emulator. running memory usage recorded 1.6mb.
+
+config:
+	#define FONT "fixed" // default x11 font
+	#define BG_COLOR "#000000" // black
+	#define FG_COLOR "#ffffff" // white
+
+compile:
+	cc -std=c89 -o xxt main.c -lX11
+
+install:
+	install -m 755 xxt /usr/local/bin/xxt
+
+deps:
+	libX11. POSIX PTY functions come from libc on glibc.
+
+size:
+	cloc result:
+		github.com/AlDanial/cloc v 2.08  T=0.01 s (104.8 files/s, 55875.1 lines/s)
+		-------------------------------------------------------------------------------
+		Language                     files          blank        comment           code
+		-------------------------------------------------------------------------------
+		C                                1            122              3            408
+		-------------------------------------------------------------------------------
+
+size result
+	text    data     bss     dec     hex filename
+   	9657     928     192   10777    2a19 ./xxt
+
+
+
+info:
+
+	I have also written a fully functional tiling window manager for x11 in 500 LOC.
+	https://github.com/KrzysztofMarciniak/minimal-window-manager
+
+	aswell as other software created in similar manner:
+
+	https://github.com/KrzysztofMarciniak/screenc 	- screenshotting tool
+	https://github.com/KrzysztofMarciniak/img 	- image (png,jpg,webp) viewer
+	https://github.com/KrzysztofMarciniak/redact	- tool for image redaction and metadata removal
