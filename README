@@ -19,6 +19,10 @@ tldr:
 		patch main.c < patches/vi-mode.patch
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
+	want it as small as possible (194 lines, dumb terminal)?
+		patch main.c < patches/bare.patch
+		cc -std=c89 -o xxt main.c -lX11 -O2
+
 	none of the above?
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
@@ -44,6 +48,12 @@ patches:
 	the patch must be removed from an otherwise unmodified main.c.
 	after applying or removing a patch, recompile.
 	patching adds lines, so the size numbers below only describe the unpatched xxt.
+
+	patches/bare.patch
+		strips xxt down to 194 lines. dumb terminal: TERM=dumb, escape
+		sequences are ignored, no resize, no arrow keys, no window close handling.
+		line editing in the shell still works. full-screen programs do not.
+		conflicts with all other patches, use it alone. Only choose this if you are trying to run xxt on a toaster.
 
 	patches/vi-mode.patch
 		adds vi-style keyboard navigation, selection and copy/paste.

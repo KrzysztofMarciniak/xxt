@@ -1,0 +1,588 @@
+--- a/main.c	2026-11-17 09:34:48.603794988 +0000
++++ b/main.c	2026-11-17 09:34:48.604847560 +0000
+@@ -1,4 +1,4 @@
+-/* xxt - tiny fullscreen X11 terminal.
++/* xxt bare - dumb fullscreen X11 terminal: TERM=dumb, no escapes, no resize.
+  * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
+  */
+ #define _XOPEN_SOURCE 600
+@@ -7,8 +7,8 @@
+ #define FONT "fixed"
+ #define BG_COLOR "#000000"
+ #define FG_COLOR "#ffffff"
+-#define PARAM_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+ 
++#include <X11/Xatom.h>
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
+ #include <X11/keysym.h>
+@@ -17,14 +17,10 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/select.h>
+-#include <sys/types.h>
+ #include <unistd.h>
+ 
+ static char *cells;
+-static int cols, rows, cx, cy;
+-static char escape, have_value;
+-static int params[4], value;
+-
++static int cols, rows, cx, cy, esc;
+ static Display *display;
+ static Window window;
+ static GC gc;
+@@ -32,18 +28,15 @@
+ static int fw, fh;
+ static unsigned long fg, bg;
+ 
+-static int param_count(void) {
+-  int i;
+-
+-  for (i = 0; i < (int)PARAM_COUNT(params); ++i)
+-    if (params[i] < 0)
+-      break;
++static unsigned long color(const char *name) {
++  XColor c;
+ 
+-  return i;
++  if (!XParseColor(display, DefaultColormap(display, 0), name, &c) ||
++      !XAllocColor(display, DefaultColormap(display, 0), &c))
++    exit(1);
++  return c.pixel;
+ }
+ 
+-static void clear_screen(void) { memset(cells, ' ', (size_t)cols * rows); }
+-
+ static void newline(void) {
+   if (++cy < rows)
+     return;
+@@ -53,390 +46,89 @@
+   memset(cells + (size_t)(rows - 1) * cols, ' ', (size_t)cols);
+ }
+ 
+-static void erase_display(int mode) {
+-  size_t pos, end;
+-
+-  pos = (size_t)cy * cols + cx;
+-  end = (size_t)cols * rows;
+-
+-  if (mode == 2)
+-    clear_screen();
+-  else if (mode == 1)
+-    memset(cells, ' ', pos + 1);
+-  else
+-    memset(cells + pos, ' ', end - pos);
+-}
+-
+-static void erase_line(int mode) {
+-  char *line;
+-
+-  line = cells + (size_t)cy * cols;
+-
+-  if (mode == 2)
+-    memset(line, ' ', (size_t)cols);
+-  else if (mode == 1)
+-    memset(line, ' ', (size_t)cx + 1);
+-  else
+-    memset(line + cx, ' ', (size_t)(cols - cx));
+-}
+-
+-static void csi_command(int command) {
+-  int row, col, mode, count;
+-
+-  count = param_count();
+-  mode = count > 0 ? params[0] : 0;
+-
+-  switch (command) {
+-  case 'J':
+-    erase_display(mode);
+-    break;
+-
+-  case 'K':
+-    erase_line(mode);
+-    break;
+-
+-  case 'H':
+-  case 'f':
+-    row = count > 0 && params[0] ? params[0] - 1 : 0;
+-    col = count > 1 && params[1] ? params[1] - 1 : 0;
+-
+-    if (row >= rows)
+-      row = rows - 1;
+-    if (col >= cols)
+-      col = cols - 1;
+-
+-    cy = row;
+-    cx = col;
+-    break;
+-
+-  case 'A':
+-    cy -= mode ? mode : 1;
+-    if (cy < 0)
+-      cy = 0;
+-    break;
+-
+-  case 'B':
+-    cy += mode ? mode : 1;
+-    if (cy >= rows)
+-      cy = rows - 1;
+-    break;
+-
+-  case 'C':
+-    cx += mode ? mode : 1;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
+-
+-  case 'D':
+-    cx -= mode ? mode : 1;
+-    if (cx < 0)
+-      cx = 0;
+-    break;
+-
+-  case 'G':
+-    cx = mode ? mode - 1 : 0;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
+-
+-  default:
+-    break;
+-  }
+-}
+-
+-static void csi_store(void) {
+-  int n;
+-
+-  n = param_count();
+-
+-  if (n < (int)PARAM_COUNT(params))
+-    params[n] = have_value ? value : 0;
+-
+-  value = 0;
+-  have_value = 0;
+-}
+-
+ static void put(int c) {
+-  if (escape == 1) {
+-    if (c == '[') {
+-      escape = 2;
+-      memset(params, -1, sizeof params);
+-      value = 0;
+-      have_value = 0;
+-    } else if (c == 'c') {
+-      clear_screen();
+-      cx = cy = 0;
+-      escape = 0;
+-    } else {
+-      escape = 0;
+-    }
+-    return;
+-  }
+-
+-  if (escape == 2) {
+-    if (c >= '0' && c <= '9') {
+-      if (value < 10000) {
+-        value = value * 10 + c - '0';
+-        if (value > 10000)
+-          value = 10000;
+-      }
+-      have_value = 1;
+-    } else if (c == ';') {
+-      csi_store();
+-    } else if (c >= 0x40 && c <= 0x7e) {
+-      csi_store();
+-      csi_command(c);
+-      escape = 0;
+-    }
++  if (esc) { /* swallow ESC x and ESC [ ... final */
++    if (esc == 1)
++      esc = c == '[' ? 2 : 0;
++    else if (c >= 0x40 && c <= 0x7e)
++      esc = 0;
+     return;
+   }
+ 
+   switch (c) {
+-  case 27:
+-    escape = 1;
+-    break;
+-
+-  case '\r':
+-    cx = 0;
+-    break;
+-
+-  case '\n':
+-    newline();
+-    break;
+-
+-  case '\b':
+-    if (cx > 0)
+-      --cx;
+-    break;
+-
+-  case '\t':
+-    cx = (cx + 8) & ~7;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
+-
+-  case '\f':
+-    clear_screen();
+-    cx = cy = 0;
+-    break;
+-
++  case 27: esc = 1; break;
++  case '\r': cx = 0; break;
++  case '\n': newline(); break;
++  case '\b': if (cx > 0) --cx; break;
++  case '\t': cx = (cx + 8) & ~7; if (cx >= cols) cx = cols - 1; break;
+   default:
+     if (c < 32 || c > 126)
+       break;
+-
+     if (cx >= cols) {
+       cx = 0;
+       newline();
+     }
+-
+     cells[(size_t)cy * cols + cx++] = (char)c;
+   }
+ }
+ 
+-static int resize_grid(int width, int height, int master) {
+-  char *next;
+-  int nc, nr, cc, cr, y;
+-  struct winsize size;
+-
+-  nc = width / fw;
+-  nr = height / fh;
+-
+-  if (nc < 1)
+-    nc = 1;
+-  if (nr < 1)
+-    nr = 1;
+-
+-  if (nc == cols && nr == rows)
+-    return 0;
+-
+-  next = (char *)malloc((size_t)nc * nr);
+-  if (!next)
+-    return -1;
+-
+-  memset(next, ' ', (size_t)nc * nr);
+-
+-  cc = cols < nc ? cols : nc;
+-  cr = rows < nr ? rows : nr;
+-
+-  for (y = 0; y < cr; ++y)
+-    memcpy(next + (size_t)y * nc, cells + (size_t)y * cols, (size_t)cc);
+-
+-  free(cells);
+-  cells = next;
+-  cols = nc;
+-  rows = nr;
+-
+-  if (cx >= cols)
+-    cx = cols - 1;
+-  if (cy >= rows)
+-    cy = rows - 1;
+-
+-  size.ws_row = (unsigned short)rows;
+-  size.ws_col = (unsigned short)cols;
+-  size.ws_xpixel = (unsigned short)width;
+-  size.ws_ypixel = (unsigned short)height;
+-
+-  ioctl(master, TIOCSWINSZ, &size);
+-
+-  return 0;
+-}
+-
+ static void draw(void) {
+   int y, x;
+ 
+   XClearWindow(display, window);
+   XSetForeground(display, gc, fg);
+   XSetBackground(display, gc, bg);
+-
+   for (y = 0; y < rows; ++y)
+     XDrawImageString(display, window, gc, 0, y * fh + font->ascent,
+                      cells + (size_t)y * cols, cols);
+-
+   x = cx < cols ? cx : cols - 1;
+-
+   XSetForeground(display, gc, bg);
+   XSetBackground(display, gc, fg);
+-
+   XDrawImageString(display, window, gc, x * fw, cy * fh + font->ascent,
+                    cells + (size_t)cy * cols + x, 1);
+-
+   XFlush(display);
+ }
+ 
+-static void fullscreen(void) {
+-  Atom state, full;
+-  XEvent event;
+-
+-  state = XInternAtom(display, "_NET_WM_STATE", False);
+-  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
+-
+-  memset(&event, 0, sizeof event);
+-  event.xclient.type = ClientMessage;
+-  event.xclient.window = window;
+-  event.xclient.message_type = state;
+-  event.xclient.format = 32;
+-  event.xclient.data.l[0] = 1;
+-  event.xclient.data.l[1] = (long)full;
+-  event.xclient.data.l[3] = 1;
+-
+-  XSendEvent(display, DefaultRootWindow(display), False,
+-             SubstructureRedirectMask | SubstructureNotifyMask, &event);
+-}
+-
+-static int special_key(KeySym key, char *buf) {
+-  const char *seq;
+-
+-  seq = NULL;
+-
+-  switch (key) {
+-  case XK_Up:
+-    seq = "\033[A";
+-    break;
+-  case XK_Down:
+-    seq = "\033[B";
+-    break;
+-  case XK_Right:
+-    seq = "\033[C";
+-    break;
+-  case XK_Left:
+-    seq = "\033[D";
+-    break;
+-  case XK_Home:
+-    seq = "\033[H";
+-    break;
+-  case XK_End:
+-    seq = "\033[F";
+-    break;
+-  case XK_Delete:
+-    seq = "\033[3~";
+-    break;
+-  default:
+-    return 0;
+-  }
+-
+-  strcpy(buf, seq);
+-  return (int)strlen(seq);
+-}
+-
+ int main(void) {
+-  int fd;
+-  for (fd = 0; fd < 3; ++fd)
+-    if (fcntl(fd, F_GETFD) == -1)
+-      open("/dev/null", O_RDWR);
+-  int master, slave, n, xfd, i, width, height;
+-  pid_t child;
++  int master, slave, n, i, xfd, width, height;
+   char *name, buf[4096];
+   const char *shell;
+   struct winsize size;
+   XEvent event;
+   KeySym key;
+-  Atom delete_window;
+-  Colormap cmap;
+-  XColor color;
+-  fd_set readfds;
++  Atom full;
++  fd_set fds;
+ 
+   display = XOpenDisplay(NULL);
+-  if (!display)
+-    return 1;
+-
+-  font = XLoadQueryFont(display, FONT);
++  font = display ? XLoadQueryFont(display, FONT) : NULL;
+   if (!font)
+     return 1;
+ 
+   fw = font->max_bounds.width;
+   fh = font->ascent + font->descent;
+-
+-  if (fw < 1 || fh < 1)
+-    return 1;
+-
+-  cmap = DefaultColormap(display, DefaultScreen(display));
+-
+-  if (!XParseColor(display, cmap, FG_COLOR, &color) ||
+-      !XAllocColor(display, cmap, &color))
+-    return 1;
+-
+-  fg = color.pixel;
+-
+-  if (!XParseColor(display, cmap, BG_COLOR, &color) ||
+-      !XAllocColor(display, cmap, &color))
+-    return 1;
+-
+-  bg = color.pixel;
+-
+-  width = DisplayWidth(display, DefaultScreen(display));
+-  height = DisplayHeight(display, DefaultScreen(display));
+-
++  fg = color(FG_COLOR);
++  bg = color(BG_COLOR);
++  width = DisplayWidth(display, 0);
++  height = DisplayHeight(display, 0);
+   cols = width / fw;
+   rows = height / fh;
+-
+-  if (cols < 1)
+-    cols = 1;
+-  if (rows < 1)
+-    rows = 1;
+-
+   cells = (char *)malloc((size_t)cols * rows);
+   if (!cells)
+     return 1;
++  memset(cells, ' ', (size_t)cols * rows);
+ 
+-  clear_screen();
+-
+-  window =
+-      XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0,
+-                          (unsigned int)width, (unsigned int)height, 0, fg, bg);
+-
++  window = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0,
++                               (unsigned int)width, (unsigned int)height, 0,
++                               fg, bg);
+   XStoreName(display, window, "xxt");
+-  XSelectInput(display, window,
+-               KeyPressMask | ExposureMask | StructureNotifyMask);
+-
+-  delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+-  XSetWMProtocols(display, window, &delete_window, 1);
+-
++  XSelectInput(display, window, KeyPressMask | ExposureMask);
+   gc = XCreateGC(display, window, 0, NULL);
+   XSetFont(display, gc, font->fid);
+ 
++  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
++  XChangeProperty(display, window, XInternAtom(display, "_NET_WM_STATE", False),
++                  XA_ATOM, 32, PropModeReplace, (unsigned char *)&full, 1);
+   XMapWindow(display, window);
+-  fullscreen();
+-
+   master = posix_openpt(O_RDWR | O_NOCTTY);
+   if (master < 0 || grantpt(master) || unlockpt(master))
+     return 1;
+@@ -444,101 +136,59 @@
+   name = ptsname(master);
+   if (!name)
+     return 1;
+-
+   size.ws_row = (unsigned short)rows;
+   size.ws_col = (unsigned short)cols;
+   size.ws_xpixel = (unsigned short)width;
+   size.ws_ypixel = (unsigned short)height;
+-
+-  if (ioctl(master, TIOCSWINSZ, &size) < 0)
+-    return 1;
+-
+-  child = fork();
+-  if (child < 0)
+-    return 1;
+-
+-  if (child == 0) {
++  ioctl(master, TIOCSWINSZ, &size);
++  if (fork() == 0) {
+     setsid();
+-
+     slave = open(name, O_RDWR);
+-    if (slave < 0)
+-      _exit(1);
+-
+     ioctl(slave, TIOCSCTTY, 0);
+     dup2(slave, 0);
+     dup2(slave, 1);
+     dup2(slave, 2);
+-
+-    if (slave > 2)
+-      close(slave);
+-
+     close(master);
+-
+-    setenv("TERM", "vt100", 1);
+-
++    setenv("TERM", "dumb", 1);
+     shell = getenv("SHELL");
+     if (!shell)
+       shell = "/bin/sh";
+-
+     execl(shell, shell, (char *)0);
+     _exit(1);
+   }
+ 
+   xfd = ConnectionNumber(display);
+-
+   for (;;) {
+     while (XPending(display)) {
+       XNextEvent(display, &event);
+-
+       if (event.type == Expose) {
+         draw();
+-
+-      } else if (event.type == ConfigureNotify) {
+-        if (resize_grid(event.xconfigure.width, event.xconfigure.height,
+-                        master) == 0)
+-          draw();
+-
+       } else if (event.type == KeyPress) {
+         n = XLookupString(&event.xkey, buf, sizeof buf, &key, NULL);
+-
+         if (key == XK_BackSpace) {
+           buf[0] = 127;
+           n = 1;
+-        } else if (n == 0) {
+-          n = special_key(key, buf);
+         }
+-
+-        if (n > 0)
+-          write(master, buf, (size_t)n);
+-
+-      } else if (event.type == ClientMessage &&
+-                 (Atom)event.xclient.data.l[0] == delete_window) {
+-        close(master);
+-        return 0;
++        if (n > 0 && write(master, buf, (size_t)n) < 0)
++          return 1;
+       }
+     }
+ 
+-    FD_ZERO(&readfds);
+-    FD_SET(xfd, &readfds);
+-    FD_SET(master, &readfds);
+-
+-    if (select((master > xfd ? master : xfd) + 1, &readfds, NULL, NULL, NULL) <
+-        0)
++    FD_ZERO(&fds);
++    FD_SET(xfd, &fds);
++    FD_SET(master, &fds);
++    if (select((master > xfd ? master : xfd) + 1, &fds, NULL, NULL, NULL) < 0)
+       continue;
+ 
+-    if (FD_ISSET(master, &readfds)) {
++    if (FD_ISSET(master, &fds)) {
+       n = (int)read(master, buf, sizeof buf);
+-
+       if (n <= 0)
+         break;
+-
+       for (i = 0; i < n; ++i)
+         put((unsigned char)buf[i]);
+-
+       draw();
+     }
+   }
+ 
+-  close(master);
+   return 0;
+ }
