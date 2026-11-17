@@ -1,9 +1,37 @@
 xxt is an extremely small X11 terminal emulator. running memory usage recorded 1.6mb.
 
+tldr:
+
+	want a fully working terminal (colors, utf-8, alternate screen, scrollback)?
+		patch main.c < patches/libvterm.patch
+		cc -std=gnu89 -o xxt main.c -lX11 -lvterm -O2
+
+	want scrollback?
+		patch main.c < patches/scrollback.patch
+		cc -std=c89 -o xxt main.c -lX11 -O2
+
+	want vi mode?
+		patch main.c < patches/vi-mode.patch
+		cc -std=c89 -o xxt main.c -lX11 -O2
+
+	want scrollback and vi mode?
+		patch main.c < patches/scrollback.patch
+		patch main.c < patches/vi-mode.patch
+		cc -std=c89 -o xxt main.c -lX11 -O2
+
+	none of the above?
+		cc -std=c89 -o xxt main.c -lX11 -O2
+
+	then:
+		install -m 755 xxt /usr/local/bin/xxt
+
+	libvterm.patch cannot be combined with the other patches.
+
 config:
 	#define FONT "fixed" // default x11 font
 	#define BG_COLOR "#000000" // black
 	#define FG_COLOR "#ffffff" // white
+	#define SCROLLBACK 10000 // lines kept (scrollback.patch; 2000 with libvterm.patch)
 
 patches:
 	to apply a patch:
@@ -17,9 +45,10 @@ patches:
 	after applying or removing a patch, recompile.
 	patching adds lines, so the size numbers below only describe the unpatched xxt.
 
-	vi-mode.patch
+	patches/vi-mode.patch
 		adds vi-style keyboard navigation, selection and copy/paste.
-		no new dependencies. no scrollback, so it works on the visible screen only.
+		no new dependencies. works on the visible screen only
+		(with scrollback.patch it does not reach into the history).
 		the current mode and search prompt are shown in the window title.
 
 		modes:
@@ -54,16 +83,49 @@ patches:
 			Shift+Insert		paste PRIMARY (input mode)
 			Ctrl+Shift+V		paste CLIPBOARD (input mode)
 
+	patches/scrollback.patch
+		adds a scrollback buffer (10000 lines, plain text, set with SCROLLBACK).
+		no new dependencies.
+		works with vi-mode.patch (apply in either order).
+
+		keys:
+			Shift+PageUp / Shift+PageDown	scroll half a screen
+			Shift+Home / Shift+End		oldest line / back to the bottom
+			mouse wheel			scroll 3 lines
+			any other key			jump back to the bottom
+
+		the top-right corner shows [offset/total] while scrolled.
+
+	patches/libvterm.patch
+		replaces the built-in escape parser with libvterm (0.3+).
+		adds:
+			16/256/truecolor
+			bold, underline, strikethrough, reverse
+			alternate screen
+			cursor visibility
+			UTF-8 (needs an iso10646-1 font)
+			TERM=xterm-256color
+			function keys, modifier keys, application cursor mode
+		includes its own scrollback (2000 lines with colors, set with SCROLLBACK),
+		same keys as scrollback.patch.
+		conflicts with scrollback.patch and vi-mode.patch, do not combine.
+		extra dependency: libvterm.
+		libvterm.h uses inline, so strict -std=c89 does not work. use -std=gnu89.
+
 compile:
 	cc -std=c89 -o xxt main.c -lX11 -O2
+
+	with libvterm.patch:
+		cc -std=gnu89 -o xxt main.c -lX11 -lvterm -O2
 
 install:
 	install -m 755 xxt /usr/local/bin/xxt
 
 deps:
 	libX11. POSIX PTY functions come from libc on glibc.
+	libvterm.patch also needs libvterm.
 
-size:
+size (unpatched):
 	github.com/AlDanial/cloc v 2.08  T=0.01 s (105.8 files/s, 57579.5 lines/s)
 	-------------------------------------------------------------------------------
 	Language                     files          blank        comment           code

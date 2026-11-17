@@ -1,0 +1,772 @@
+--- a/main.c	2026-11-17 08:26:44.092959125 +0000
++++ b/main.c	2026-11-17 08:41:35.618234249 +0000
+@@ -1,5 +1,5 @@
+ /* xxt - tiny fullscreen X11 terminal.
+- * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
++ * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11 -lvterm
+  */
+ #define _XOPEN_SOURCE 600
+ #define _DEFAULT_SOURCE
+@@ -7,7 +7,7 @@
+ #define FONT "fixed"
+ #define BG_COLOR "#000000"
+ #define FG_COLOR "#ffffff"
+-#define PARAM_COUNT(a) (sizeof(a) / sizeof((a)[0]))
++#define SCROLLBACK 2000 /* lines kept */
+ 
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
+@@ -19,224 +19,270 @@
+ #include <sys/select.h>
+ #include <sys/types.h>
+ #include <unistd.h>
++#include <vterm.h>
+ 
+-static char *cells;
+-static int cols, rows, cx, cy;
+-static char escape, have_value;
+-static int params[4], value;
++struct line {
++  VTermScreenCell *cells;
++  int n;
++};
++
++static VTerm *vt;
++static VTermScreen *vts;
++static int cols, rows, cx, cy, cursor_visible = 1, ptyfd;
++static struct line hist[SCROLLBACK];
++static int hstart, hcount, scroll_off;
+ 
+ static Display *display;
+ static Window window;
+ static GC gc;
+ static XFontStruct *font;
++static Colormap cmap;
+ static int fw, fh;
+ static unsigned long fg, bg;
++static XChar2b *text;
+ 
+-static int param_count(void) {
+-  int i;
++static struct {
++  unsigned long rgb, pixel;
++} palette[256];
++static int palette_n;
+ 
+-  for (i = 0; i < (int)PARAM_COUNT(params); ++i)
+-    if (params[i] < 0)
+-      break;
++static void output(const char *s, size_t len, void *user) {
++  ssize_t w;
+ 
+-  return i;
+-}
++  (void)user;
+ 
+-static void clear_screen(void) { memset(cells, ' ', (size_t)cols * rows); }
++  while (len > 0) {
++    w = write(ptyfd, s, len);
++    if (w <= 0)
++      break;
++    s += w;
++    len -= (size_t)w;
++  }
++}
+ 
+-static void newline(void) {
+-  if (++cy < rows)
+-    return;
++static int cb_cursor(VTermPos pos, VTermPos old, int visible, void *user) {
++  (void)old;
++  (void)user;
+ 
+-  cy = rows - 1;
+-  memmove(cells, cells + cols, (size_t)(rows - 1) * cols);
+-  memset(cells + (size_t)(rows - 1) * cols, ' ', (size_t)cols);
++  cx = pos.col;
++  cy = pos.row;
++  cursor_visible = visible;
++  return 1;
+ }
+ 
+-static void erase_display(int mode) {
+-  size_t pos, end;
+-
+-  pos = (size_t)cy * cols + cx;
+-  end = (size_t)cols * rows;
++static int cb_prop(VTermProp prop, VTermValue *val, void *user) {
++  (void)user;
+ 
+-  if (mode == 2)
+-    clear_screen();
+-  else if (mode == 1)
+-    memset(cells, ' ', pos + 1);
+-  else
+-    memset(cells + pos, ' ', end - pos);
++  if (prop == VTERM_PROP_CURSORVISIBLE)
++    cursor_visible = val->boolean;
++  return 1;
+ }
+ 
+-static void erase_line(int mode) {
+-  char *line;
++static int blank_cell(const VTermScreenCell *c) {
++  return (c->chars[0] == 0 || c->chars[0] == ' ') && !c->attrs.reverse &&
++         VTERM_COLOR_IS_DEFAULT_BG(&c->bg);
++}
+ 
+-  line = cells + (size_t)cy * cols;
++static int cb_push(int ncols, const VTermScreenCell *cells, void *user) {
++  struct line *l;
++  int n, idx;
+ 
+-  if (mode == 2)
+-    memset(line, ' ', (size_t)cols);
+-  else if (mode == 1)
+-    memset(line, ' ', (size_t)cx + 1);
+-  else
+-    memset(line + cx, ' ', (size_t)(cols - cx));
+-}
++  (void)user;
+ 
+-static void csi_command(int command) {
+-  int row, col, mode, count;
++  for (n = ncols; n > 0 && blank_cell(&cells[n - 1]); --n)
++    ;
+ 
+-  count = param_count();
+-  mode = count > 0 ? params[0] : 0;
++  if (hcount == SCROLLBACK) {
++    idx = hstart;
++    hstart = (hstart + 1) % SCROLLBACK;
++    free(hist[idx].cells);
++  } else {
++    idx = (hstart + hcount++) % SCROLLBACK;
++  }
+ 
+-  switch (command) {
+-  case 'J':
+-    erase_display(mode);
+-    break;
++  l = &hist[idx];
++  l->n = 0;
++  l->cells = (VTermScreenCell *)malloc(sizeof *l->cells * (size_t)(n ? n : 1));
++  if (!l->cells)
++    return 1;
+ 
+-  case 'K':
+-    erase_line(mode);
+-    break;
++  memcpy(l->cells, cells, sizeof *l->cells * (size_t)n);
++  l->n = n;
+ 
+-  case 'H':
+-  case 'f':
+-    row = count > 0 && params[0] ? params[0] - 1 : 0;
+-    col = count > 1 && params[1] ? params[1] - 1 : 0;
++  if (scroll_off > 0 && scroll_off < hcount)
++    ++scroll_off;
+ 
+-    if (row >= rows)
+-      row = rows - 1;
+-    if (col >= cols)
+-      col = cols - 1;
++  return 1;
++}
+ 
+-    cy = row;
+-    cx = col;
+-    break;
++static unsigned long color_pixel(VTermColor c, int is_bg) {
++  XColor xc;
++  unsigned long key;
++  int i;
+ 
+-  case 'A':
+-    cy -= mode ? mode : 1;
+-    if (cy < 0)
+-      cy = 0;
+-    break;
++  if (is_bg ? VTERM_COLOR_IS_DEFAULT_BG(&c) : VTERM_COLOR_IS_DEFAULT_FG(&c))
++    return is_bg ? bg : fg;
+ 
+-  case 'B':
+-    cy += mode ? mode : 1;
+-    if (cy >= rows)
+-      cy = rows - 1;
+-    break;
++  vterm_screen_convert_color_to_rgb(vts, &c);
++  key = ((unsigned long)c.rgb.red << 16) | ((unsigned long)c.rgb.green << 8) |
++        c.rgb.blue;
++
++  for (i = 0; i < palette_n; ++i)
++    if (palette[i].rgb == key)
++      return palette[i].pixel;
++
++  xc.red = (unsigned short)(c.rgb.red * 257);
++  xc.green = (unsigned short)(c.rgb.green * 257);
++  xc.blue = (unsigned short)(c.rgb.blue * 257);
++  xc.flags = DoRed | DoGreen | DoBlue;
++
++  if (!XAllocColor(display, cmap, &xc))
++    return is_bg ? bg : fg;
++
++  if (palette_n < (int)(sizeof palette / sizeof palette[0])) {
++    palette[palette_n].rgb = key;
++    palette[palette_n++].pixel = xc.pixel;
++  }
+ 
+-  case 'C':
+-    cx += mode ? mode : 1;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
++  return xc.pixel;
++}
+ 
+-  case 'D':
+-    cx -= mode ? mode : 1;
+-    if (cx < 0)
+-      cx = 0;
+-    break;
++static void cell_colors(const VTermScreenCell *c, unsigned long *f,
++                        unsigned long *b) {
++  unsigned long t;
+ 
+-  case 'G':
+-    cx = mode ? mode - 1 : 0;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
++  *f = color_pixel(c->fg, 0);
++  *b = color_pixel(c->bg, 1);
+ 
+-  default:
+-    break;
++  if (c->attrs.reverse) {
++    t = *f;
++    *f = *b;
++    *b = t;
+   }
+ }
+ 
+-static void csi_store(void) {
+-  int n;
++static void draw_line(int y, int x0, const VTermScreenCell *line, int n) {
++  unsigned long f, b, f2, b2;
++  uint32_t ch;
++  int i, j, base;
++
++  i = 0;
++  while (i < n) {
++    cell_colors(&line[i], &f, &b);
++
++    for (j = i; j < n; ++j) {
++      cell_colors(&line[j], &f2, &b2);
++      if (f2 != f || b2 != b || line[j].attrs.bold != line[i].attrs.bold ||
++          line[j].attrs.underline != line[i].attrs.underline ||
++          line[j].attrs.strike != line[i].attrs.strike)
++        break;
+ 
+-  n = param_count();
++      ch = line[j].chars[0];
++      if (ch < 32 || ch == (uint32_t)-1)
++        ch = ' ';
++      else if (ch > 0xffff)
++        ch = '?';
+ 
+-  if (n < (int)PARAM_COUNT(params))
+-    params[n] = have_value ? value : 0;
++      text[j - i].byte1 = (unsigned char)(ch >> 8);
++      text[j - i].byte2 = (unsigned char)(ch & 0xff);
++    }
+ 
+-  value = 0;
+-  have_value = 0;
+-}
++    base = y * fh + font->ascent;
+ 
+-static void put(int c) {
+-  if (escape == 1) {
+-    if (c == '[') {
+-      escape = 2;
+-      memset(params, -1, sizeof params);
+-      value = 0;
+-      have_value = 0;
+-    } else if (c == 'c') {
+-      clear_screen();
+-      cx = cy = 0;
+-      escape = 0;
+-    } else {
+-      escape = 0;
+-    }
+-    return;
+-  }
++    XSetForeground(display, gc, f);
++    XSetBackground(display, gc, b);
++    XDrawImageString16(display, window, gc, (x0 + i) * fw, base, text, j - i);
++
++    if (line[i].attrs.bold)
++      XDrawString16(display, window, gc, (x0 + i) * fw + 1, base, text, j - i);
++    if (line[i].attrs.underline)
++      XDrawLine(display, window, gc, (x0 + i) * fw, y * fh + fh - 1,
++                (x0 + j) * fw - 1, y * fh + fh - 1);
++    if (line[i].attrs.strike)
++      XDrawLine(display, window, gc, (x0 + i) * fw, y * fh + fh / 2,
++                (x0 + j) * fw - 1, y * fh + fh / 2);
+ 
+-  if (escape == 2) {
+-    if (c >= '0' && c <= '9') {
+-      if (value < 10000) {
+-        value = value * 10 + c - '0';
+-        if (value > 10000)
+-          value = 10000;
+-      }
+-      have_value = 1;
+-    } else if (c == ';') {
+-      csi_store();
+-    } else if (c >= 0x40 && c <= 0x7e) {
+-      csi_store();
+-      csi_command(c);
+-      escape = 0;
+-    }
+-    return;
++    i = j;
+   }
++}
+ 
+-  switch (c) {
+-  case 27:
+-    escape = 1;
+-    break;
++static int put_num(char *out, int v) {
++  char tmp[12];
++  int n, i;
++
++  n = 0;
++  do {
++    tmp[n++] = (char)('0' + v % 10);
++    v /= 10;
++  } while (v);
+ 
+-  case '\r':
+-    cx = 0;
+-    break;
++  for (i = 0; i < n; ++i)
++    out[i] = tmp[n - 1 - i];
+ 
+-  case '\n':
+-    newline();
+-    break;
++  return n;
++}
+ 
+-  case '\b':
+-    if (cx > 0)
+-      --cx;
+-    break;
++static void draw(void) {
++  VTermScreenCell *line, cell;
++  VTermPos pos;
++  struct line *l;
++  char tag[32];
++  int y, x, v, n;
+ 
+-  case '\t':
+-    cx = (cx + 8) & ~7;
+-    if (cx >= cols)
+-      cx = cols - 1;
+-    break;
++  line = (VTermScreenCell *)malloc(sizeof *line * (size_t)cols);
++  if (!line)
++    return;
+ 
+-  case '\f':
+-    clear_screen();
+-    cx = cy = 0;
+-    break;
++  XClearWindow(display, window);
+ 
+-  default:
+-    if (c < 32 || c > 126)
+-      break;
++  for (y = 0; y < rows; ++y) {
++    v = hcount - scroll_off + y;
+ 
+-    if (cx >= cols) {
+-      cx = 0;
+-      newline();
++    if (v < hcount) {
++      l = &hist[(hstart + v) % SCROLLBACK];
++      draw_line(y, 0, l->cells, l->n);
++      continue;
+     }
+ 
+-    cells[(size_t)cy * cols + cx++] = (char)c;
++    pos.row = v - hcount;
++    for (x = 0; x < cols; ++x) {
++      pos.col = x;
++      vterm_screen_get_cell(vts, pos, &line[x]);
++    }
++    draw_line(y, 0, line, cols);
+   }
++
++  free(line);
++
++  if (scroll_off) {
++    n = 0;
++    tag[n++] = '[';
++    n += put_num(tag + n, scroll_off);
++    tag[n++] = '/';
++    n += put_num(tag + n, hcount);
++    tag[n++] = ']';
++
++    if (n <= cols) {
++      XSetForeground(display, gc, bg);
++      XSetBackground(display, gc, fg);
++      XDrawImageString(display, window, gc, (cols - n) * fw, font->ascent, tag,
++                       n);
++    }
++  } else if (cursor_visible && cx < cols && cy < rows) {
++    pos.row = cy;
++    pos.col = cx;
++    vterm_screen_get_cell(vts, pos, &cell);
++    cell.attrs.reverse = !cell.attrs.reverse;
++    draw_line(cy, cx, &cell, 1);
++  }
++
++  XFlush(display);
+ }
+ 
+ static int resize_grid(int width, int height, int master) {
+-  char *next;
+-  int nc, nr, cc, cr, y;
++  XChar2b *next;
+   struct winsize size;
++  int nc, nr;
+ 
+   nc = width / fw;
+   nr = height / fh;
+@@ -249,27 +295,18 @@
+   if (nc == cols && nr == rows)
+     return 0;
+ 
+-  next = (char *)malloc((size_t)nc * nr);
++  next = (XChar2b *)realloc(text, sizeof *text * (size_t)nc);
+   if (!next)
+     return -1;
+ 
+-  memset(next, ' ', (size_t)nc * nr);
+-
+-  cc = cols < nc ? cols : nc;
+-  cr = rows < nr ? rows : nr;
+-
+-  for (y = 0; y < cr; ++y)
+-    memcpy(next + (size_t)y * nc, cells + (size_t)y * cols, (size_t)cc);
+-
+-  free(cells);
+-  cells = next;
++  text = next;
+   cols = nc;
+   rows = nr;
+ 
+-  if (cx >= cols)
+-    cx = cols - 1;
+-  if (cy >= rows)
+-    cy = rows - 1;
++  vterm_set_size(vt, rows, cols);
++
++  if (scroll_off > hcount)
++    scroll_off = hcount;
+ 
+   size.ws_row = (unsigned short)rows;
+   size.ws_col = (unsigned short)cols;
+@@ -281,28 +318,6 @@
+   return 0;
+ }
+ 
+-static void draw(void) {
+-  int y, x;
+-
+-  XClearWindow(display, window);
+-  XSetForeground(display, gc, fg);
+-  XSetBackground(display, gc, bg);
+-
+-  for (y = 0; y < rows; ++y)
+-    XDrawImageString(display, window, gc, 0, y * fh + font->ascent,
+-                     cells + (size_t)y * cols, cols);
+-
+-  x = cx < cols ? cx : cols - 1;
+-
+-  XSetForeground(display, gc, bg);
+-  XSetBackground(display, gc, fg);
+-
+-  XDrawImageString(display, window, gc, x * fw, cy * fh + font->ascent,
+-                   cells + (size_t)cy * cols + x, 1);
+-
+-  XFlush(display);
+-}
+-
+ static void fullscreen(void) {
+   Atom state, full;
+   XEvent event;
+@@ -323,39 +338,122 @@
+              SubstructureRedirectMask | SubstructureNotifyMask, &event);
+ }
+ 
+-static int special_key(KeySym key, char *buf) {
+-  const char *seq;
++static void scroll_by(int delta) {
++  scroll_off += delta;
++
++  if (scroll_off > hcount)
++    scroll_off = hcount;
++  if (scroll_off < 0)
++    scroll_off = 0;
++}
++
++static int scroll_key(KeySym key, unsigned int state) {
++  if (!(state & ShiftMask))
++    return 0;
++
++  switch (key) {
++  case XK_Prior:
++    scroll_by(rows / 2);
++    return 1;
++  case XK_Next:
++    scroll_by(-(rows / 2));
++    return 1;
++  case XK_Home:
++    scroll_by(hcount);
++    return 1;
++  case XK_End:
++    scroll_by(-hcount);
++    return 1;
++  default:
++    return 0;
++  }
++}
++
++static void send_key(KeySym key, unsigned int state, const char *buf, int n) {
++  VTermModifier mod, alt;
++  VTermKey vk;
++  int i;
++
++  mod = VTERM_MOD_NONE;
++  if (state & ShiftMask)
++    mod = (VTermModifier)(mod | VTERM_MOD_SHIFT);
++  if (state & Mod1Mask)
++    mod = (VTermModifier)(mod | VTERM_MOD_ALT);
++  if (state & ControlMask)
++    mod = (VTermModifier)(mod | VTERM_MOD_CTRL);
+ 
+-  seq = NULL;
++  alt = (state & Mod1Mask) ? VTERM_MOD_ALT : VTERM_MOD_NONE;
++  vk = VTERM_KEY_NONE;
+ 
+   switch (key) {
++  case XK_Return:
++  case XK_KP_Enter:
++    vk = VTERM_KEY_ENTER;
++    break;
++  case XK_Tab:
++  case 0xfe20: /* ISO_Left_Tab */
++    vk = VTERM_KEY_TAB;
++    break;
++  case XK_BackSpace:
++    vk = VTERM_KEY_BACKSPACE;
++    break;
++  case XK_Escape:
++    vk = VTERM_KEY_ESCAPE;
++    break;
+   case XK_Up:
+-    seq = "\033[A";
++    vk = VTERM_KEY_UP;
+     break;
+   case XK_Down:
+-    seq = "\033[B";
++    vk = VTERM_KEY_DOWN;
++    break;
++  case XK_Left:
++    vk = VTERM_KEY_LEFT;
+     break;
+   case XK_Right:
+-    seq = "\033[C";
++    vk = VTERM_KEY_RIGHT;
+     break;
+-  case XK_Left:
+-    seq = "\033[D";
++  case XK_Insert:
++    vk = VTERM_KEY_INS;
++    break;
++  case XK_Delete:
++    vk = VTERM_KEY_DEL;
+     break;
+   case XK_Home:
+-    seq = "\033[H";
++    vk = VTERM_KEY_HOME;
+     break;
+   case XK_End:
+-    seq = "\033[F";
++    vk = VTERM_KEY_END;
+     break;
+-  case XK_Delete:
+-    seq = "\033[3~";
++  case XK_Prior:
++    vk = VTERM_KEY_PAGEUP;
++    break;
++  case XK_Next:
++    vk = VTERM_KEY_PAGEDOWN;
+     break;
+   default:
+-    return 0;
++    if (key >= XK_F1 && key <= XK_F12)
++      vk = (VTermKey)VTERM_KEY_FUNCTION(key - XK_F1 + 1);
++    break;
++  }
++
++  if (vk != VTERM_KEY_NONE) {
++    vterm_keyboard_key(vt, vk, mod);
++    return;
+   }
+ 
+-  strcpy(buf, seq);
+-  return (int)strlen(seq);
++  if (n > 0) {
++    if (state & ControlMask) {
++      if (state & Mod1Mask)
++        output("\033", 1, NULL);
++      output(buf, (size_t)n, NULL);
++      return;
++    }
++
++    for (i = 0; i < n; ++i)
++      vterm_keyboard_unichar(vt, (unsigned char)buf[i], alt);
++  } else if ((key & 0xff000000) == 0x01000000) {
++    vterm_keyboard_unichar(vt, (uint32_t)(key & 0xffffff), alt);
++  }
+ }
+ 
+ int main(void) {
+@@ -363,7 +461,8 @@
+   for (fd = 0; fd < 3; ++fd)
+     if (fcntl(fd, F_GETFD) == -1)
+       open("/dev/null", O_RDWR);
+-  int master, slave, n, xfd, i, width, height;
++  int master, slave, n, xfd, width, height;
++  static VTermScreenCallbacks callbacks;
+   pid_t child;
+   char *name, buf[4096];
+   const char *shell;
+@@ -371,7 +470,6 @@
+   XEvent event;
+   KeySym key;
+   Atom delete_window;
+-  Colormap cmap;
+   XColor color;
+   fd_set readfds;
+ 
+@@ -414,11 +512,25 @@
+   if (rows < 1)
+     rows = 1;
+ 
+-  cells = (char *)malloc((size_t)cols * rows);
+-  if (!cells)
++  text = (XChar2b *)malloc(sizeof *text * (size_t)cols);
++  if (!text)
++    return 1;
++
++  vt = vterm_new(rows, cols);
++  if (!vt)
+     return 1;
+ 
+-  clear_screen();
++  vterm_set_utf8(vt, 1);
++  vterm_output_set_callback(vt, output, NULL);
++
++  vts = vterm_obtain_screen(vt);
++  vterm_screen_enable_altscreen(vts, 1);
++
++  callbacks.movecursor = cb_cursor;
++  callbacks.settermprop = cb_prop;
++  callbacks.sb_pushline = cb_push;
++  vterm_screen_set_callbacks(vts, &callbacks, NULL);
++  vterm_screen_reset(vts, 1);
+ 
+   window =
+       XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0,
+@@ -426,7 +538,8 @@
+ 
+   XStoreName(display, window, "xxt");
+   XSelectInput(display, window,
+-               KeyPressMask | ExposureMask | StructureNotifyMask);
++               KeyPressMask | ButtonPressMask | ExposureMask |
++                   StructureNotifyMask);
+ 
+   delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+   XSetWMProtocols(display, window, &delete_window, 1);
+@@ -441,6 +554,8 @@
+   if (master < 0 || grantpt(master) || unlockpt(master))
+     return 1;
+ 
++  ptyfd = master;
++
+   name = ptsname(master);
+   if (!name)
+     return 1;
+@@ -474,7 +589,8 @@
+ 
+     close(master);
+ 
+-    setenv("TERM", "vt100", 1);
++    setenv("TERM", "xterm-256color", 1);
++    setenv("COLORTERM", "truecolor", 1);
+ 
+     shell = getenv("SHELL");
+     if (!shell)
+@@ -498,19 +614,26 @@
+                         master) == 0)
+           draw();
+ 
++      } else if (event.type == ButtonPress) {
++        if (event.xbutton.button == Button4)
++          scroll_by(3);
++        else if (event.xbutton.button == Button5)
++          scroll_by(-3);
++        draw();
++
+       } else if (event.type == KeyPress) {
+         n = XLookupString(&event.xkey, buf, sizeof buf, &key, NULL);
+ 
+-        if (key == XK_BackSpace) {
+-          buf[0] = 127;
+-          n = 1;
+-        } else if (n == 0) {
+-          n = special_key(key, buf);
++        if (scroll_key(key, event.xkey.state)) {
++          draw();
++        } else if (!IsModifierKey(key)) {
++          if (scroll_off) {
++            scroll_off = 0;
++            draw();
++          }
++          send_key(key, event.xkey.state, buf, n);
+         }
+ 
+-        if (n > 0)
+-          write(master, buf, (size_t)n);
+-
+       } else if (event.type == ClientMessage &&
+                  (Atom)event.xclient.data.l[0] == delete_window) {
+         close(master);
+@@ -532,9 +655,7 @@
+       if (n <= 0)
+         break;
+ 
+-      for (i = 0; i < n; ++i)
+-        put((unsigned char)buf[i]);
+-
++      vterm_input_write(vt, buf, (size_t)n);
+       draw();
+     }
+   }
