@@ -5,6 +5,55 @@ config:
 	#define BG_COLOR "#000000" // black
 	#define FG_COLOR "#ffffff" // white
 
+patches:
+	to apply a patch:
+		patch main.c < patches/<filename>
+
+	to remove a patch:
+		patch -R main.c < patches/<filename>
+
+	if you apply several patches, remove them in reverse order.
+	the patch must be removed from an otherwise unmodified main.c.
+	after applying or removing a patch, recompile.
+	patching adds lines, so the size numbers below only describe the unpatched xxt.
+
+	vi-mode.patch
+		adds vi-style keyboard navigation, selection and copy/paste.
+		no new dependencies. no scrollback, so it works on the visible screen only.
+		the current mode and search prompt are shown in the window title.
+
+		modes:
+			input	default. keys go to the shell.
+			normal	cursor movement on the screen.
+			visual	text selection (v = characters, V = lines).
+
+		keys:
+			Ctrl+Shift+Space	input -> normal
+			i, q, Esc		normal -> input
+			v, V			normal -> visual / visual-line (press again to cancel)
+			Esc			visual -> normal
+
+		normal and visual keys:
+			h j k l, arrows		move
+			w W b B e E		word motions
+			0 ^ $			line start, first non-blank, line end
+			gg G H M L		first line, last line, screen top / middle / bottom
+			Ctrl-d Ctrl-u		half page down / up
+			Ctrl-f Ctrl-b		page down / up
+			f F t T ; ,		find character in line, repeat, reverse
+			/ ? n N			search forward / backward, next, previous
+			%			matching bracket
+			counts			e.g. 5j, 3w, 10G
+			o			visual: swap selection ends
+			y, Enter		visual: yank selection and return to input
+			yy, Y			normal: yank line(s)
+			p			paste clipboard into the shell and return to input
+
+		clipboard:
+			yanked text is set as X PRIMARY and CLIPBOARD.
+			Shift+Insert		paste PRIMARY (input mode)
+			Ctrl+Shift+V		paste CLIPBOARD (input mode)
+
 compile:
 	cc -std=c89 -o xxt main.c -lX11 -O2
 
