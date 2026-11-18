@@ -8,14 +8,8 @@ tldr:
 		patch main.c < patches/copypaste.patch
 		patch main.c < patches/blink.patch
 		patch main.c < patches/libvterm-vi.patch
-		sed -i 's|#define FONT ".*"|#define FONT "-*-curie-medium-r-*-*-*-*-*-*-*-*-*-*"|' main.c
 		cc -std=gnu89 -o xxt main.c -lX11 -lvterm -O2
 		install -m 755 xxt /usr/local/bin/xxt
-
-	curie: https://github.com/oppiliappan/curie
-		install the font as described in its README, then check the name with
-		`xlsfonts | grep -i curie`. if the wildcard above does not match, put the
-		full name from xlsfonts into FONT. libvterm patches want an iso10646-1 font.
 
 	just the original (no patches):
 		cc -std=c89 -o xxt main.c -lX11 -O2
