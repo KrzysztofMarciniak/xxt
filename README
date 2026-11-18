@@ -1,41 +1,60 @@
 xxt is an extremely small X11 terminal emulator. running memory usage recorded 1.6mb.
+main.c is the original, unpatched xxt. every feature is a patch.
 
 tldr:
 
-	want a fully working terminal (colors, utf-8, alternate screen, scrollback)?
-		patch main.c < patches/libvterm.patch
+	my config (copy/paste, blinking cursor, libvterm with scrollback, vi mode, curie font):
+		patch main.c < patches/config.patch
+		patch main.c < patches/copypaste.patch
+		patch main.c < patches/blink.patch
+		patch main.c < patches/libvterm-vi.patch
+		sed -i 's|#define FONT ".*"|#define FONT "-*-curie-medium-r-*-*-*-*-*-*-*-*-*-*"|' main.c
 		cc -std=gnu89 -o xxt main.c -lX11 -lvterm -O2
+		install -m 755 xxt /usr/local/bin/xxt
 
-	want scrollback?
-		patch main.c < patches/scrollback.patch
+	curie: https://github.com/oppiliappan/curie
+		install the font as described in its README, then check the name with
+		`xlsfonts | grep -i curie`. if the wildcard above does not match, put the
+		full name from xlsfonts into FONT. libvterm patches want an iso10646-1 font.
+
+	just the original (no patches):
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
-	want vi mode?
-		patch main.c < patches/vi-mode.patch
-		cc -std=c89 -o xxt main.c -lX11 -O2
-
-	want scrollback and vi mode?
-		patch main.c < patches/scrollback.patch
-		patch main.c < patches/vi-mode.patch
-		cc -std=c89 -o xxt main.c -lX11 -O2
-
-	want it as small as possible (194 lines, dumb terminal)?
+	smallest possible (194 lines, dumb terminal):
 		patch main.c < patches/bare.patch
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
-	none of the above?
-		cc -std=c89 -o xxt main.c -lX11 -O2
+	patches stack, apply them in this order:
+		1. config.patch                       always first, every patch except bare needs it
+		2. copypaste.patch                    needed by scrollback, vi-mode, libvterm, libvterm-vi
+		3. blink.patch, transparency.patch    any time after config, any order
+		4. scrollback.patch and/or vi-mode.patch
+		   or libvterm.patch                  (includes scrollback)
+		   or libvterm-vi.patch               (includes scrollback and vi mode)
 
-	then:
-		install -m 755 xxt /usr/local/bin/xxt
+	not combinable: libvterm.patch / libvterm-vi.patch with scrollback.patch or
+	vi-mode.patch or each other. bare.patch is used alone, on the original main.c.
+	every valid combination and order was test-applied and compiled.
 
-	libvterm.patch cannot be combined with the other patches.
-
-config:
-	#define FONT "fixed" // default x11 font
-	#define BG_COLOR "#000000" // black
-	#define FG_COLOR "#ffffff" // white
-	#define SCROLLBACK 10000 // lines kept (scrollback.patch; 2000 with libvterm.patch)
+config (everything is a #define at the top of main.c):
+	config.patch
+		appearance	FONT BG_COLOR FG_COLOR
+		window		WIN_TITLE WIN_CLASS FULLSCREEN WIN_WIDTH WIN_HEIGHT
+		terminal	TERM_NAME DEFAULT_SHELL TAB_WIDTH BACKSPACE_CODE READ_SIZE
+		also adds the small hooks the other patches build on
+		(pixel_of, create_window, row_text, draw_span, draw_cursor).
+	copypaste.patch
+		MOUSE_SELECT MOUSE_PASTE_BUTTON MULTI_CLICK_MS WORD_CHARS COPY_ON_SELECT
+		COPY_TO_CLIPBOARD SEL_CLEAR_ON_OUTPUT SEL_BG_COLOR SEL_FG_COLOR
+		KEY_COPY KEY_PASTE KEY_PASTE_PRIMARY (each with a _MOD modifier mask)
+	blink.patch
+		CURSOR_COLOR CURSOR_STYLE (0 block, 1 underline, 2 bar) CURSOR_BLINK
+		CURSOR_BLINK_MS CURSOR_THICKNESS CURSOR_UNFOCUSED_BOX
+	transparency.patch   OPACITY
+	scrollback.patch     SCROLLBACK WHEEL_LINES SCROLL_TAG
+	vi-mode.patch        VI_ENTER_KEY VI_ENTER_MOD VI_SEND_ESC_MOD
+	libvterm.patch       SCROLLBACK WHEEL_LINES SCROLL_TAG COLORTERM
+	libvterm-vi.patch    all of the above plus VI_ALTSCREEN_PASS
 
 patches:
 	to apply a patch:
@@ -44,30 +63,41 @@ patches:
 	to remove a patch:
 		patch -R main.c < patches/<filename>
 
-	if you apply several patches, remove them in reverse order.
-	the patch must be removed from an otherwise unmodified main.c.
+	remove in reverse order, from an otherwise unmodified main.c.
 	after applying or removing a patch, recompile.
 	patching adds lines, so the size numbers below only describe the unpatched xxt.
 
-	patches/bare.patch
-		strips xxt down to 194 lines. dumb terminal: TERM=dumb, escape
-		sequences are ignored, no resize, no arrow keys, no window close handling.
-		line editing in the shell still works. full-screen programs do not.
-		conflicts with all other patches, use it alone. Only choose this if you are trying to run xxt on a toaster.
+	patches/config.patch
+		moves the hard-coded settings of main.c into #defines at the top.
+		fullscreen is a switch now. no behaviour change with the defaults.
 
-	patches/vi-mode.patch
-		adds vi-style keyboard navigation, selection and copy/paste.
-		no new dependencies. works on the visible screen only
-		(with scrollback.patch it does not reach into the history).
-		the current mode and search prompt are shown in the window title.
+	patches/copypaste.patch   (needs config)
+		mouse: drag = select, double click = word, triple click = line.
+		middle click pastes PRIMARY. selecting copies to PRIMARY.
+		Ctrl+Shift+C copies to CLIPBOARD, Ctrl+Shift+V pastes CLIPBOARD,
+		Shift+Insert pastes PRIMARY. other X11 apps can paste what xxt copies.
+		the selection is cleared when new output arrives (SEL_CLEAR_ON_OUTPUT).
 
-		modes:
-			input	default. keys go to the shell.
-			normal	cursor movement on the screen.
-			visual	text selection (v = characters, V = lines).
+	patches/blink.patch   (needs config)
+		blinking cursor. steady while typing. hollow box when the window is
+		unfocused. block, underline or bar style.
+
+	patches/transparency.patch   (needs config)
+		background opacity via a 32-bit ARGB visual. text stays solid.
+		needs a compositing manager (picom, xcompmgr, ...). without a 32-bit
+		visual the window is simply opaque.
+		set OPACITY (0-255) at the top, or XXT_OPACITY=<0-255> in the environment.
+		selection and cursor colors are always opaque.
+		with libvterm patches only the default background is translucent.
+
+	patches/vi-mode.patch   (needs config + copypaste)
+		vi-style keyboard navigation, selection and copy/paste, no new dependencies.
+		works on the visible screen (with scrollback.patch also on the scrolled view).
+		the mode and search prompt are shown in the window title.
 
 		keys:
-			Ctrl+Shift+Space	input -> normal
+			Esc			input -> normal (VI_ENTER_KEY / VI_ENTER_MOD)
+			Shift+Esc		send a real Esc to the shell (VI_SEND_ESC_MOD)
 			i, q, Esc		normal -> input
 			v, V			normal -> visual / visual-line (press again to cancel)
 			Esc			visual -> normal
@@ -86,46 +116,44 @@ patches:
 			o			visual: swap selection ends
 			y, Enter		visual: yank selection and return to input
 			yy, Y			normal: yank line(s)
-			p			paste clipboard into the shell and return to input
+			p			normal: paste clipboard into the shell, return to input
 
-		clipboard:
-			yanked text is set as X PRIMARY and CLIPBOARD.
-			Shift+Insert		paste PRIMARY (input mode)
-			Ctrl+Shift+V		paste CLIPBOARD (input mode)
+		yanked text goes to PRIMARY and CLIPBOARD.
 
-	patches/scrollback.patch
-		adds a scrollback buffer (10000 lines, plain text, set with SCROLLBACK).
-		no new dependencies.
-		works with vi-mode.patch (apply in either order).
-
-		keys:
-			Shift+PageUp / Shift+PageDown	scroll half a screen
-			Shift+Home / Shift+End		oldest line / back to the bottom
-			mouse wheel			scroll 3 lines
-			any other key			jump back to the bottom
-
+	patches/scrollback.patch   (needs config + copypaste)
+		scrollback buffer (10000 lines, plain text, SCROLLBACK). no new dependencies.
+		Shift+PageUp / Shift+PageDown	scroll half a screen
+		Shift+Home / Shift+End		oldest line / back to the bottom
+		mouse wheel			scroll WHEEL_LINES lines
+		typing jumps back to the bottom. scrolling clears the mouse selection.
 		the top-right corner shows [offset/total] while scrolled.
 
-	patches/libvterm.patch
+	patches/libvterm.patch   (needs config + copypaste)
 		replaces the built-in escape parser with libvterm (0.3+).
-		adds:
-			16/256/truecolor
-			bold, underline, strikethrough, reverse
-			alternate screen
-			cursor visibility
-			UTF-8 (needs an iso10646-1 font)
-			TERM=xterm-256color
-			function keys, modifier keys, application cursor mode
-		includes its own scrollback (2000 lines with colors, set with SCROLLBACK),
-		same keys as scrollback.patch.
-		conflicts with scrollback.patch and vi-mode.patch, do not combine.
-		extra dependency: libvterm.
-		libvterm.h uses inline, so strict -std=c89 does not work. use -std=gnu89.
+		16/256/truecolor, bold, underline, strikethrough, reverse, alternate screen,
+		cursor visibility, UTF-8 (needs an iso10646-1 font), TERM=xterm-256color,
+		function keys, modifier keys, application cursor mode.
+		includes scrollback (2000 lines with colors), same keys as scrollback.patch.
+		mouse selection and clipboard work on the scrolled view too.
+		extra dependency: libvterm. libvterm.h uses inline: use -std=gnu89.
+
+	patches/libvterm-vi.patch   (needs config + copypaste)
+		libvterm.patch + vi mode in one patch. same vi keys as vi-mode.patch.
+		Esc enters normal mode, Shift+Esc sends a real Esc.
+		while a full-screen program (vim, less) uses the alternate screen, Esc goes
+		to the program (VI_ALTSCREEN_PASS 1; set 0 to always enter vi mode).
+		vi works on the scrolled view and yanks UTF-8.
+
+	patches/bare.patch
+		strips xxt down to 194 lines. dumb terminal: TERM=dumb, escape
+		sequences are ignored, no resize, no arrow keys, no window close handling.
+		line editing in the shell still works. full-screen programs do not.
+		conflicts with all other patches, use it alone. Only choose this if you are trying to run xxt on a toaster.
 
 compile:
 	cc -std=c89 -o xxt main.c -lX11 -O2
 
-	with libvterm.patch:
+	with libvterm.patch or libvterm-vi.patch:
 		cc -std=gnu89 -o xxt main.c -lX11 -lvterm -O2
 
 install:
@@ -133,7 +161,7 @@ install:
 
 deps:
 	libX11. POSIX PTY functions come from libc on glibc.
-	libvterm.patch also needs libvterm.
+	libvterm patches also need libvterm.
 
 size (unpatched):
 	github.com/AlDanial/cloc v 2.08  T=0.01 s (105.8 files/s, 57579.5 lines/s)

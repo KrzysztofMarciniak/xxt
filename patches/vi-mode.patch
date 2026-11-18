@@ -1,51 +1,43 @@
---- a/main.c	2026-11-17 08:26:44.092959125 +0000
-+++ b/main.c	2026-11-17 08:27:26.600609809 +0000
-@@ -1,5 +1,11 @@
- /* xxt - tiny fullscreen X11 terminal.
-  * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
-+ *
-+ * vi modes: Ctrl+Shift+Space enters NORMAL. i/q/Esc return to INPUT.
-+ * NORMAL: hjkl w/W b/B e/E 0 ^ $ gg G H M L f/F/t/T ; , / ? n N %
-+ *         Ctrl-d/u/f/b, counts, v (VISUAL), V (V-LINE), y/yy/Y, p.
-+ * VISUAL: motions, o, y or Enter yanks. Esc returns to NORMAL.
-+ * INPUT:  Shift+Insert pastes PRIMARY, Ctrl+Shift+V pastes CLIPBOARD.
-  */
- #define _XOPEN_SOURCE 600
- #define _DEFAULT_SOURCE
-@@ -11,8 +17,11 @@
+--- a/main.c
++++ b/main.c
+@@ -44,6 +44,12 @@
+ #define KEY_PASTE_PRIMARY XK_Insert /* paste PRIMARY */
+ #define KEY_PASTE_PRIMARY_MOD ShiftMask
  
- #include <X11/Xlib.h>
- #include <X11/Xutil.h>
-+#include <X11/Xatom.h>
++/* vi mode */
++#define VI_ENTER_KEY XK_Escape /* key that enters NORMAL mode from INPUT */
++#define VI_ENTER_MOD 0         /* exact modifiers (Shift/Control/Mod1 mask) */
++#define VI_SEND_ESC_MOD ShiftMask /* with VI_ENTER_KEY = Escape: this +Esc sends
++                                     a real ESC to the shell */
++
+ /* ------------------------------------------------------------------------ */
+ 
+ #define PARAM_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+@@ -54,6 +60,7 @@
  #include <X11/keysym.h>
-+#include <ctype.h>
+ #include <ctype.h>
  #include <fcntl.h>
 +#include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
  #include <sys/ioctl.h>
-@@ -32,6 +41,17 @@
- static int fw, fh;
- static unsigned long fg, bg;
+@@ -77,6 +84,12 @@
+ 
+ static int ptyfd;
  
 +enum { VI_INPUT, VI_NORMAL, VI_VISUAL, VI_LINE };
 +
 +static int vmode, vx, vy, ax, ay, vcount, pending, searching;
 +static int last_find, last_char, search_dir = 1, search_len, qlen;
 +static char search[128], qbuf[128];
-+static int ptyfd;
-+static Atom a_clip, a_utf8, a_targets, a_prop;
-+static char *clip;
-+static size_t clip_len;
 +
-+
- static int param_count(void) {
-   int i;
- 
-@@ -270,6 +290,14 @@
-     cx = cols - 1;
-   if (cy >= rows)
-     cy = rows - 1;
+ static int sel_on, sel_drag, sel_moved, sel_mode, sel_ax, sel_ay, sel_bx, sel_by;
+ static Atom a_clip, a_utf8, a_targets, a_prop;
+ static char *clip;
+@@ -334,6 +347,14 @@
+   cols = nc;
+   rows = nr;
+   sel_on = sel_drag = 0;
 +  if (vx >= cols)
 +    vx = cols - 1;
 +  if (vy >= rows)
@@ -55,15 +47,19 @@
 +  if (ay >= rows)
 +    ay = rows - 1;
  
-   size.ws_row = (unsigned short)rows;
-   size.ws_col = (unsigned short)cols;
-@@ -281,8 +309,655 @@
+   if (cx >= cols)
+     cx = cols - 1;
+@@ -631,6 +652,532 @@
    return 0;
  }
  
 +static void set_mode(int m) {
-+  static const char *names[] = {"xxt", "xxt [NORMAL]", "xxt [VISUAL]",
-+                                "xxt [V-LINE]"};
++  static const char *names[] = {WIN_TITLE, WIN_TITLE " [NORMAL]",
++                                WIN_TITLE " [VISUAL]", WIN_TITLE " [V-LINE]"};
++
++  if ((vmode == VI_VISUAL || vmode == VI_LINE) && m != VI_VISUAL &&
++      m != VI_LINE)
++    sel_on = 0;
 +
 +  vmode = m;
 +  vcount = 0;
@@ -75,8 +71,8 @@
 +static void search_title(void) {
 +  char title[160];
 +
-+  snprintf(title, sizeof title, "xxt %c%.*s", search_dir > 0 ? '/' : '?', qlen,
-+           qbuf);
++  snprintf(title, sizeof title, WIN_TITLE " %c%.*s", search_dir > 0 ? '/' : '?',
++           qlen, qbuf);
 +  XStoreName(display, window, title);
 +}
 +
@@ -99,7 +95,7 @@
 +static int first_nonblank(int y) {
 +  int x;
 +
-+  for (x = 0; x < cols - 1 && cells[(size_t)y * cols + x] == ' '; ++x)
++  for (x = 0; x < cols - 1 && cell_ch(y * cols + x) == ' '; ++x)
 +    ;
 +  return x;
 +}
@@ -107,20 +103,20 @@
 +static int last_nonblank(int y) {
 +  int x;
 +
-+  for (x = cols - 1; x > 0 && cells[(size_t)y * cols + x] == ' '; --x)
++  for (x = cols - 1; x > 0 && cell_ch(y * cols + x) == ' '; --x)
 +    ;
 +  return x;
 +}
 +
 +static int cls(int p, int big) {
-+  char c;
++  int c;
 +
-+  c = cells[p];
-+  if (c == ' ')
++  c = cell_ch(p);
++  if (c == ' ' || c == 0)
 +    return 0;
 +  if (big)
 +    return 1;
-+  return (isalnum((unsigned char)c) || c == '_') ? 1 : 2;
++  return (c >= 128 || isalnum(c) || c == '_') ? 1 : 2;
 +}
 +
 +static int word_fwd(int p, int big) {
@@ -168,12 +164,10 @@
 +}
 +
 +static void vi_find(int cmd, int ch, int n, int repeat) {
-+  char *row;
 +  int x, step, till;
 +
 +  step = (cmd == 'f' || cmd == 't') ? 1 : -1;
 +  till = (cmd == 't' || cmd == 'T');
-+  row = cells + (size_t)vy * cols;
 +  x = vx;
 +
 +  if (till && repeat)
@@ -181,7 +175,7 @@
 +
 +  for (; n > 0; --n) {
 +    x += step;
-+    while (x >= 0 && x < cols && row[x] != ch)
++    while (x >= 0 && x < cols && cell_ch(vy * cols + x) != ch)
 +      x += step;
 +    if (x < 0 || x >= cols)
 +      return;
@@ -190,6 +184,17 @@
 +  if (till)
 +    x -= step;
 +  vx = x;
++}
++
++static int match_at(int p) {
++  int k;
++
++  if (p % cols + search_len > cols)
++    return 0;
++  for (k = 0; k < search_len; ++k)
++    if (cell_ch(p + k) != (unsigned char)search[k])
++      return 0;
++  return 1;
 +}
 +
 +static void vi_search(int dir) {
@@ -202,8 +207,7 @@
 +  start = vy * cols + vx;
 +  for (i = 1; i <= total; ++i) {
 +    p = ((start + dir * i) % total + total) % total;
-+    if (p % cols + search_len <= cols &&
-+        !memcmp(cells + p, search, (size_t)search_len)) {
++    if (match_at(p)) {
 +      vi_pos(p);
 +      return;
 +    }
@@ -217,7 +221,7 @@
 +
 +  total = cols * rows;
 +  p = vy * cols + vx;
-+  q = strchr(pairs, cells[p]);
++  q = cell_ch(p) ? strchr(pairs, cell_ch(p)) : NULL;
 +  if (!q)
 +    return;
 +
@@ -228,9 +232,9 @@
 +  depth = 0;
 +
 +  for (; p >= 0 && p < total; p += d) {
-+    if (cells[p] == open)
++    if (cell_ch(p) == open)
 +      ++depth;
-+    else if (cells[p] == close_)
++    else if (cell_ch(p) == close_)
 +      --depth;
 +    if (depth == 0) {
 +      vi_pos(p);
@@ -239,56 +243,15 @@
 +  }
 +}
 +
-+static void sel_range(int *s, int *e) {
-+  int a, b;
-+
-+  a = ay * cols + ax;
-+  b = vy * cols + vx;
-+
-+  if (vmode == VI_LINE) {
-+    *s = (ay < vy ? ay : vy) * cols;
-+    *e = ((ay > vy ? ay : vy) + 1) * cols - 1;
-+  } else {
-+    *s = a < b ? a : b;
-+    *e = a < b ? b : a;
-+  }
-+}
-+
-+static void yank(void) {
-+  char *buf;
-+  size_t n;
-+  int s, e, p, end, len;
-+
-+  sel_range(&s, &e);
-+  buf = (char *)malloc((size_t)(e - s + 1) + (size_t)rows + 1);
-+  if (!buf)
-+    return;
-+
-+  n = 0;
-+  p = s;
-+  while (p <= e) {
-+    end = (p / cols + 1) * cols - 1;
-+    if (end > e)
-+      end = e;
-+
-+    len = end - p + 1;
-+    while (len > 0 && cells[p + len - 1] == ' ')
-+      --len;
-+
-+    memcpy(buf + n, cells + p, (size_t)len);
-+    n += (size_t)len;
-+
-+    if (end < e)
-+      buf[n++] = '\n';
-+    p = end + 1;
-+  }
-+
-+  free(clip);
-+  clip = buf;
-+  clip_len = n;
-+
-+  XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
-+  XSetSelectionOwner(display, a_clip, window, CurrentTime);
++static void vi_yank(void) {
++  sel_ax = ax;
++  sel_ay = ay;
++  sel_bx = vx;
++  sel_by = vy;
++  sel_mode = vmode == VI_LINE ? 2 : 0;
++  sel_on = 1;
++  sel_copy(1);
++  sel_on = 0;
 +}
 +
 +static void yank_lines(int n) {
@@ -297,93 +260,8 @@
 +  vy += n - 1;
 +  vi_clamp();
 +  vmode = VI_LINE;
-+  yank();
++  vi_yank();
 +  set_mode(VI_INPUT);
-+}
-+
-+static void paste_text(const char *s, size_t n) {
-+  char *t;
-+  size_t i, off;
-+  ssize_t w;
-+
-+  t = (char *)malloc(n ? n : 1);
-+  if (!t)
-+    return;
-+
-+  for (i = 0; i < n; ++i)
-+    t[i] = s[i] == '\n' ? '\r' : s[i];
-+
-+  for (off = 0; off < n; off += (size_t)w) {
-+    w = write(ptyfd, t + off, n - off);
-+    if (w <= 0)
-+      break;
-+  }
-+
-+  free(t);
-+}
-+
-+static void paste(Atom sel) {
-+  if (XGetSelectionOwner(display, sel) == window) {
-+    if (clip)
-+      paste_text(clip, clip_len);
-+  } else {
-+    XConvertSelection(display, sel, a_utf8, a_prop, window, CurrentTime);
-+  }
-+}
-+
-+static void selection_request(XSelectionRequestEvent *rq) {
-+  XSelectionEvent ev;
-+  Atom targets[3];
-+
-+  memset(&ev, 0, sizeof ev);
-+  ev.type = SelectionNotify;
-+  ev.requestor = rq->requestor;
-+  ev.selection = rq->selection;
-+  ev.target = rq->target;
-+  ev.time = rq->time;
-+  ev.property = None;
-+
-+  if (!rq->property)
-+    rq->property = rq->target;
-+
-+  if (rq->target == a_targets) {
-+    targets[0] = a_targets;
-+    targets[1] = a_utf8;
-+    targets[2] = XA_STRING;
-+    XChangeProperty(display, rq->requestor, rq->property, XA_ATOM, 32,
-+                    PropModeReplace, (unsigned char *)targets, 3);
-+    ev.property = rq->property;
-+  } else if ((rq->target == a_utf8 || rq->target == XA_STRING) && clip) {
-+    XChangeProperty(display, rq->requestor, rq->property, rq->target, 8,
-+                    PropModeReplace, (unsigned char *)clip, (int)clip_len);
-+    ev.property = rq->property;
-+  }
-+
-+  XSendEvent(display, rq->requestor, False, 0, (XEvent *)&ev);
-+}
-+
-+static void selection_notify(XSelectionEvent *ev) {
-+  Atom type;
-+  int format;
-+  unsigned long n, left;
-+  unsigned char *data;
-+
-+  if (ev->property == None) {
-+    if (ev->target == a_utf8)
-+      XConvertSelection(display, ev->selection, XA_STRING, a_prop, window,
-+                        CurrentTime);
-+    return;
-+  }
-+
-+  data = NULL;
-+  if (XGetWindowProperty(display, window, ev->property, 0, 65536, True,
-+                         AnyPropertyType, &type, &format, &n, &left,
-+                         &data) == Success &&
-+      data)
-+    paste_text((const char *)data, (size_t)n);
-+
-+  if (data)
-+    XFree(data);
 +}
 +
 +static void vi_enter(void) {
@@ -496,7 +374,10 @@
 +
 +  switch (c) {
 +  case 27:
-+    set_mode(vmode == VI_NORMAL ? VI_INPUT : VI_NORMAL);
++    if (vmode == VI_NORMAL)
++      set_mode(VI_INPUT);
++    else
++      set_mode(VI_NORMAL);
 +    return;
 +
 +  case 'q':
@@ -649,7 +530,7 @@
 +      pending = 'y';
 +      return;
 +    }
-+    yank();
++    vi_yank();
 +    set_mode(VI_INPUT);
 +    return;
 +  case 'Y':
@@ -658,7 +539,7 @@
 +  case '\r':
 +  case '\n':
 +    if (vmode != VI_NORMAL)
-+      yank();
++      vi_yank();
 +    set_mode(VI_INPUT);
 +    return;
 +
@@ -676,22 +557,19 @@
 +  vcount = 0;
 +}
 +
-+static int handle_key(KeySym key, int c, unsigned int state) {
-+  unsigned int cs;
 +
-+  cs = ControlMask | ShiftMask;
++static int handle_key(KeySym key, int c, unsigned int state) {
++  unsigned int m;
++
++  m = state & (ShiftMask | ControlMask | Mod1Mask);
 +
 +  if (vmode == VI_INPUT) {
-+    if (key == XK_space && (state & cs) == cs) {
++    if (key == VI_ENTER_KEY && m == VI_ENTER_MOD) {
 +      vi_enter();
 +      return 1;
 +    }
-+    if (key == XK_Insert && (state & ShiftMask)) {
-+      paste(XA_PRIMARY);
-+      return 1;
-+    }
-+    if ((key == XK_V || key == XK_v) && (state & cs) == cs) {
-+      paste(a_clip);
++    if (key == XK_Escape && m == VI_SEND_ESC_MOD) {
++      paste_text("\033", 1);
 +      return 1;
 +    }
 +    return 0;
@@ -701,90 +579,62 @@
 +  return 1;
 +}
 +
-+static void draw_span(int y, int x0, int x1, int inverse) {
-+  XSetForeground(display, gc, inverse ? bg : fg);
-+  XSetBackground(display, gc, inverse ? fg : bg);
-+  XDrawImageString(display, window, gc, x0 * fw, y * fh + font->ascent,
-+                   cells + (size_t)y * cols + x0, x1 - x0 + 1);
+ /* paint cells [x0, x1] of row y with the given colors */
+ static void draw_span(int y, int x0, int x1, unsigned long f,
+                       unsigned long b) {
+@@ -640,9 +1187,30 @@
+                    row_text(y) + x0, x1 - x0 + 1);
+ }
+ 
++/* keep the highlighted selection in step with the visual mode */
++static void vi_sync_sel(void) {
++  if (vmode != VI_VISUAL && vmode != VI_LINE)
++    return;
++
++  sel_ax = ax;
++  sel_ay = ay;
++  sel_bx = vx;
++  sel_by = vy;
++  sel_mode = vmode == VI_LINE ? 2 : 0;
++  sel_on = 1;
 +}
 +
- static void draw(void) {
--  int y, x;
-+  int y, x, s, e, x0, x1;
- 
-   XClearWindow(display, window);
-   XSetForeground(display, gc, fg);
-@@ -292,13 +967,20 @@
-     XDrawImageString(display, window, gc, 0, y * fh + font->ascent,
-                      cells + (size_t)y * cols, cols);
- 
--  x = cx < cols ? cx : cols - 1;
--
--  XSetForeground(display, gc, bg);
--  XSetBackground(display, gc, fg);
--
--  XDrawImageString(display, window, gc, x * fw, cy * fh + font->ascent,
--                   cells + (size_t)cy * cols + x, 1);
-+  if (vmode == VI_INPUT) {
-+    x = cx < cols ? cx : cols - 1;
-+    draw_span(cy, x, x, 1);
-+  } else {
-+    if (vmode != VI_NORMAL) {
-+      sel_range(&s, &e);
-+      for (y = s / cols; y <= e / cols; ++y) {
-+        x0 = y == s / cols ? s % cols : 0;
-+        x1 = y == e / cols ? e % cols : cols - 1;
-+        draw_span(y, x0, x1, 1);
-+      }
-+    }
-+    draw_span(vy, vx, vx, vmode == VI_NORMAL);
-+  }
- 
-   XFlush(display);
- }
-@@ -431,6 +1113,11 @@
-   delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
-   XSetWMProtocols(display, window, &delete_window, 1);
- 
-+  a_clip = XInternAtom(display, "CLIPBOARD", False);
-+  a_utf8 = XInternAtom(display, "UTF8_STRING", False);
-+  a_targets = XInternAtom(display, "TARGETS", False);
-+  a_prop = XInternAtom(display, "XXT_SELECTION", False);
++static void vi_draw_cursor(void) {
++  if (vmode == VI_NORMAL)
++    draw_span(vy, vx, vx, bg_solid, cursor_pixel);
++  else
++    draw_span(vy, vx, vx, fg, bg);
++}
 +
-   gc = XCreateGC(display, window, 0, NULL);
-   XSetFont(display, gc, font->fid);
+ static void draw_sel(void) {
+   int s, e, y, x0, x1;
  
-@@ -441,6 +1128,7 @@
-   if (master < 0 || grantpt(master) || unlockpt(master))
-     return 1;
++  vi_sync_sel();
+   if (!sel_on)
+     return;
  
-+  ptyfd = master;
-   name = ptsname(master);
-   if (!name)
-     return 1;
-@@ -501,6 +1189,12 @@
-       } else if (event.type == KeyPress) {
-         n = XLookupString(&event.xkey, buf, sizeof buf, &key, NULL);
+@@ -657,6 +1225,11 @@
+ static void draw_cursor(void) {
+   int x;
  
++  if (vmode != VI_INPUT) {
++    vi_draw_cursor();
++    return;
++  }
++
+   if (cy >= rows)
+     return;
+ 
+@@ -934,6 +1507,12 @@
+           draw();
+           continue;
+         }
++
 +        if (handle_key(key, n > 0 ? (unsigned char)buf[0] : 0,
 +                       event.xkey.state)) {
 +          draw();
 +          continue;
 +        }
-+
-         if (key == XK_BackSpace) {
-           buf[0] = 127;
-           n = 1;
-@@ -511,6 +1205,12 @@
-         if (n > 0)
-           write(master, buf, (size_t)n);
  
-+      } else if (event.type == SelectionRequest) {
-+        selection_request(&event.xselectionrequest);
-+
-+      } else if (event.type == SelectionNotify) {
-+        selection_notify(&event.xselection);
-+
-       } else if (event.type == ClientMessage &&
-                  (Atom)event.xclient.data.l[0] == delete_window) {
-         close(master);
+         if (key == XK_BackSpace) {
+           buf[0] = BACKSPACE_CODE;

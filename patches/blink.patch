@@ -1,0 +1,160 @@
+--- a/main.c
++++ b/main.c
+@@ -11,6 +11,14 @@
+ #define BG_COLOR "#000000"
+ #define FG_COLOR "#ffffff"
+ 
++/* cursor */
++#define CURSOR_COLOR "#ffffff"
++#define CURSOR_STYLE 0        /* 0 block, 1 underline, 2 bar */
++#define CURSOR_BLINK 1        /* 1 = blink, 0 = steady */
++#define CURSOR_BLINK_MS 530   /* time per on/off phase */
++#define CURSOR_THICKNESS 2    /* pixels, underline and bar */
++#define CURSOR_UNFOCUSED_BOX 1 /* hollow box while the window has no focus */
++
+ /* window */
+ #define WIN_TITLE "xxt"
+ #define WIN_CLASS "xxt"
+@@ -46,6 +54,21 @@
+ static char escape, have_value;
+ static int params[4], value;
+ 
++static int focused = 1, blink_on = 1;
++static long next_blink;
++
++static long tick_ms(void) {
++  struct timeval tv;
++
++  gettimeofday(&tv, NULL);
++  return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
++}
++
++static void blink_reset(void) {
++  blink_on = 1;
++  next_blink = tick_ms() + CURSOR_BLINK_MS;
++}
++
+ static Display *display;
+ static Window window;
+ static GC gc;
+@@ -342,7 +365,29 @@
+ 
+   x = cx < cols ? cx : cols - 1;
+ 
+-  draw_span(cy, x, x, bg_solid, cursor_pixel);
++  if (!focused) {
++    if (CURSOR_UNFOCUSED_BOX) {
++      XSetForeground(display, gc, cursor_pixel);
++      XDrawRectangle(display, window, gc, x * fw, cy * fh,
++                     (unsigned int)fw - 1, (unsigned int)fh - 1);
++    }
++    return;
++  }
++
++  if (CURSOR_BLINK && !blink_on)
++    return;
++
++  XSetForeground(display, gc, cursor_pixel);
++
++  if (CURSOR_STYLE == 1) {
++    XFillRectangle(display, window, gc, x * fw, cy * fh + fh - CURSOR_THICKNESS,
++                   (unsigned int)fw, CURSOR_THICKNESS);
++  } else if (CURSOR_STYLE == 2) {
++    XFillRectangle(display, window, gc, x * fw, cy * fh, CURSOR_THICKNESS,
++                   (unsigned int)fh);
++  } else {
++    draw_span(cy, x, x, bg_solid, cursor_pixel);
++  }
+ }
+ 
+ static void draw(void) {
+@@ -434,11 +479,13 @@
+   char *name, buf[READ_SIZE];
+   const char *shell;
+   struct winsize size;
++  struct timeval tv, *tvp;
+   XClassHint hint;
+   XEvent event;
+   KeySym key;
+   Atom delete_window;
+   fd_set readfds;
++  long wait;
+ 
+   display = XOpenDisplay(NULL);
+   if (!display)
+@@ -459,7 +506,7 @@
+   fg = parse_color(FG_COLOR, 0);
+   bg = parse_color(BG_COLOR, 1);
+   bg_solid = parse_color(BG_COLOR, 0);
+-  cursor_pixel = fg;
++  cursor_pixel = parse_color(CURSOR_COLOR, 0);
+ 
+   if (FULLSCREEN) {
+     width = DisplayWidth(display, DefaultScreen(display));
+@@ -491,6 +538,12 @@
+   XSetClassHint(display, window, &hint);
+   XSelectInput(display, window,
+                KeyPressMask | ExposureMask | StructureNotifyMask);
++  {
++    XWindowAttributes wa;
++
++    XGetWindowAttributes(display, window, &wa);
++    XSelectInput(display, window, wa.your_event_mask | FocusChangeMask);
++  }
+ 
+   delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+   XSetWMProtocols(display, window, &delete_window, 1);
+@@ -550,6 +603,7 @@
+   }
+ 
+   xfd = ConnectionNumber(display);
++  blink_reset();
+ 
+   for (;;) {
+     while (XPending(display)) {
+@@ -563,8 +617,15 @@
+                         master) == 0)
+           draw();
+ 
++      } else if (event.type == FocusIn || event.type == FocusOut) {
++        focused = event.type == FocusIn;
++        blink_reset();
++        draw();
++
+       } else if (event.type == KeyPress) {
+         n = XLookupString(&event.xkey, buf, sizeof buf, &key, NULL);
++        blink_reset();
++        draw();
+ 
+         if (key == XK_BackSpace) {
+           buf[0] = BACKSPACE_CODE;
+@@ -587,11 +648,28 @@
+     FD_SET(xfd, &readfds);
+     FD_SET(master, &readfds);
+ 
+-    if (select((master > xfd ? master : xfd) + 1, &readfds, NULL, NULL, NULL) <
++    tvp = NULL;
++    if (CURSOR_BLINK && focused) {
++      wait = next_blink - tick_ms();
++      if (wait < 0)
++        wait = 0;
++      tv.tv_sec = wait / 1000;
++      tv.tv_usec = (wait % 1000) * 1000;
++      tvp = &tv;
++    }
++
++    if (select((master > xfd ? master : xfd) + 1, &readfds, NULL, NULL, tvp) <
+         0)
+       continue;
+ 
++    if (CURSOR_BLINK && focused && tick_ms() >= next_blink) {
++      blink_on = !blink_on;
++      next_blink = tick_ms() + CURSOR_BLINK_MS;
++      draw();
++    }
++
+     if (FD_ISSET(master, &readfds)) {
++      blink_reset();
+       n = (int)read(master, buf, sizeof buf);
+ 
+       if (n <= 0)

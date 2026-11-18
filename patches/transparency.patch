@@ -1,0 +1,113 @@
+--- a/main.c
++++ b/main.c
+@@ -17,6 +17,8 @@
+ #define FULLSCREEN 1 /* 1 = fullscreen, 0 = WIN_WIDTH x WIN_HEIGHT */
+ #define WIN_WIDTH 800
+ #define WIN_HEIGHT 600
++#define OPACITY 200 /* background opacity 0-255, text stays solid (needs a
++                       compositor, e.g. picom); env XXT_OPACITY overrides */
+ 
+ /* terminal */
+ #define TERM_NAME "vt100"
+@@ -55,13 +57,67 @@
+ static unsigned long fg, bg, bg_solid, cursor_pixel;
+ 
+ 
++static Visual *argb_visual; /* NULL: no 32-bit visual, windows stay opaque */
++static int argb_depth, argb_ready, argb_alpha;
++static Colormap argb_cmap;
++
++static int shift_of(unsigned long mask) {
++  int n;
++
++  for (n = 0; mask && !(mask & 1); mask >>= 1)
++    ++n;
++  return n;
++}
++
++static void argb_init(void) {
++  XVisualInfo vi;
++  const char *env;
++
++  if (argb_ready)
++    return;
++  argb_ready = 1;
++
++  argb_alpha = OPACITY;
++  env = getenv("XXT_OPACITY");
++  if (env)
++    argb_alpha = atoi(env);
++  if (argb_alpha < 0)
++    argb_alpha = 0;
++  if (argb_alpha >= 255)
++    return;
++
++  if (!XMatchVisualInfo(display, DefaultScreen(display), 32, TrueColor, &vi))
++    return;
++
++  argb_visual = vi.visual;
++  argb_depth = vi.depth;
++  argb_cmap = XCreateColormap(display, DefaultRootWindow(display),
++                              argb_visual, AllocNone);
++}
++
++/* with an ARGB visual a pixel is premultiplied alpha + r, g, b */
+ static unsigned long pixel_of(XColor *c, int translucent) {
+-  (void)translucent;
++  unsigned long a, r, g, b, amask;
+ 
+-  if (!XAllocColor(display, cmap, c))
+-    exit(1);
++  argb_init();
+ 
+-  return c->pixel;
++  if (!argb_visual) {
++    if (!XAllocColor(display, cmap, c))
++      exit(1);
++    return c->pixel;
++  }
++
++  a = translucent ? (unsigned long)argb_alpha : 255;
++  r = (unsigned long)(c->red >> 8) * a / 255;
++  g = (unsigned long)(c->green >> 8) * a / 255;
++  b = (unsigned long)(c->blue >> 8) * a / 255;
++  amask = ~(argb_visual->red_mask | argb_visual->green_mask |
++            argb_visual->blue_mask) &
++          0xffffffffUL;
++
++  return (r << shift_of(argb_visual->red_mask)) |
++         (g << shift_of(argb_visual->green_mask)) |
++         (b << shift_of(argb_visual->blue_mask)) | (a << shift_of(amask));
+ }
+ 
+ static unsigned long parse_color(const char *spec, int translucent) {
+@@ -364,11 +420,26 @@
+ }
+ 
+ static Window create_window(int width, int height) {
+-  return XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0,
+-                             (unsigned int)width, (unsigned int)height, 0, fg,
+-                             bg);
++  XSetWindowAttributes attr;
++
++  argb_init();
++
++  if (!argb_visual)
++    return XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0,
++                               (unsigned int)width, (unsigned int)height, 0,
++                               fg, bg);
++
++  attr.colormap = argb_cmap;
++  attr.background_pixel = bg;
++  attr.border_pixel = 0;
++
++  return XCreateWindow(display, DefaultRootWindow(display), 0, 0,
++                       (unsigned int)width, (unsigned int)height, 0,
++                       argb_depth, InputOutput, argb_visual,
++                       CWColormap | CWBackPixel | CWBorderPixel, &attr);
+ }
+ 
++
+ static void fullscreen(void) {
+   Atom state, full;
+   XEvent event;
