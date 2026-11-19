@@ -1,5 +1,5 @@
---- a/main.c
-+++ b/main.c
+--- main.c
++++ main.c
 @@ -1,5 +1,5 @@
  /* xxt - tiny X11 terminal.
 - * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
@@ -7,7 +7,7 @@
   */
  #define _XOPEN_SOURCE 600
  #define _DEFAULT_SOURCE
-@@ -19,11 +19,15 @@
+@@ -27,11 +27,15 @@
  #define WIN_HEIGHT 600
  
  /* terminal */
@@ -24,7 +24,7 @@
  
  /* mouse selection and clipboard */
  #define MOUSE_SELECT 1          /* 1 = select text with the mouse */
-@@ -44,9 +48,15 @@
+@@ -52,9 +56,17 @@
  #define KEY_PASTE_PRIMARY XK_Insert /* paste PRIMARY */
  #define KEY_PASTE_PRIMARY_MOD ShiftMask
  
@@ -34,15 +34,17 @@
 +#define VI_ENTER_MOD 0         /* exact modifiers (Shift/Control/Mod1 mask) */
 +#define VI_SEND_ESC_MOD ShiftMask /* with VI_ENTER_KEY = Escape: this +Esc sends
 +                                     a real ESC to the shell */
-+#define VI_ALTSCREEN_PASS 1 /* 1 = while a full-screen program (vim, less)
-+                               runs, VI_ENTER_KEY goes to the program */
++#define VI_ALTSCREEN_PASS 1 /* 1 = while a program owns the terminal (alternate
++                               screen, or any foreground job such as a vi
++                               clone), VI_ENTER_KEY goes to the program and
++                               Shift+Esc enters vi mode */
  
 -#define PARAM_COUNT(a) (sizeof(a) / sizeof((a)[0]))
 +/* ------------------------------------------------------------------------ */
  
  #include <X11/Xatom.h>
  #include <X11/Xlib.h>
-@@ -54,6 +64,7 @@
+@@ -62,6 +74,7 @@
  #include <X11/keysym.h>
  #include <ctype.h>
  #include <fcntl.h>
@@ -50,7 +52,7 @@
  #include <stdlib.h>
  #include <string.h>
  #include <sys/ioctl.h>
-@@ -61,11 +72,28 @@
+@@ -69,11 +82,29 @@
  #include <sys/time.h>
  #include <sys/types.h>
  #include <unistd.h>
@@ -73,6 +75,7 @@
 +
 +static struct line hist[SCROLLBACK];
 +static int hstart, hcount, scroll_off;
++static pid_t shell_pgrp;
 +static XChar2b *text;
 +static VTermScreenCell *rowbuf;
 +
@@ -81,9 +84,9 @@
 +} palette[256];
 +static int palette_n;
  
- static Display *display;
- static Window window;
-@@ -77,6 +105,12 @@
+ static int focused = 1, blink_on = 1;
+ static long next_blink;
+@@ -100,6 +131,12 @@
  
  static int ptyfd;
  
@@ -96,7 +99,7 @@
  static int sel_on, sel_drag, sel_moved, sel_mode, sel_ax, sel_ay, sel_bx, sel_by;
  static Atom a_clip, a_utf8, a_targets, a_prop;
  static char *clip;
-@@ -100,262 +134,231 @@
+@@ -123,262 +160,251 @@
    return pixel_of(&c, translucent);
  }
  
@@ -153,12 +156,12 @@
 +  sel_on = sel_drag = 0;
 +  if (vx >= cols)
 +    vx = cols - 1;
-+  if (vy >= rows)
-+    vy = rows - 1;
++  if (vy >= hcount + rows)
++    vy = hcount + rows - 1;
 +  if (ax >= cols)
 +    ax = cols - 1;
-+  if (ay >= rows)
-+    ay = rows - 1;
++  if (ay >= hcount + rows)
++    ay = hcount + rows - 1;
  
 -  if (mode == 2)
 -    clear_screen();
@@ -292,6 +295,14 @@
 +    ;
 +
 +  if (hcount == SCROLLBACK) {
++    if (vy > 0)
++      --vy;
++    if (ay > 0)
++      --ay;
++    if (sel_ay > 0)
++      --sel_ay;
++    if (sel_by > 0)
++      --sel_by;
 +    idx = hstart;
 +    hstart = (hstart + 1) % SCROLLBACK;
 +    free(hist[idx].cells);
@@ -336,13 +347,20 @@
 -    } else {
 -      escape = 0;
 -    }
--    return;
--  }
-+/* cell (x, y) of the window: scrollback while scrolled, else the screen */
-+static void view_cell(int x, int y, VTermScreenCell *out) {
++/* absolute rows: 0 = oldest scrollback line, hcount + rows - 1 = last screen
++ * row. vi cursor, anchor and selection use these, so they survive scrolling */
++static int vtotal(void) { return hcount + rows; }
++static int vbase(void) { return hcount - scroll_off; }
++
++/* cell (x, v) of scrollback + screen, v absolute */
++static void abs_cell(int x, int v, VTermScreenCell *out) {
 +  VTermPos pos;
 +  struct line *l;
-+  int v;
++
++  if (v < 0 || v >= hcount + rows) {
++    *out = blank;
+     return;
+   }
  
 -  if (escape == 2) {
 -    if (c >= '0' && c <= '9') {
@@ -359,8 +377,6 @@
 -      csi_command(c);
 -      escape = 0;
 -    }
-+  v = hcount - scroll_off + y;
-+
 +  if (v < hcount) {
 +    l = &hist[(hstart + v) % SCROLLBACK];
 +    if (x < l->n)
@@ -393,14 +409,18 @@
 -    if (cx >= cols)
 -      cx = cols - 1;
 -    break;
--
++  pos.row = v - hcount;
++  pos.col = x;
++  vterm_screen_get_cell(vts, pos, out);
++}
+ 
 -  case '\f':
 -    clear_screen();
 -    cx = cy = 0;
 -    break;
-+  pos.row = v - hcount;
-+  pos.col = x;
-+  vterm_screen_get_cell(vts, pos, out);
++/* cell (x, y) of the window */
++static void view_cell(int x, int y, VTermScreenCell *out) {
++  abs_cell(x, vbase() + y, out);
 +}
  
 -  default:
@@ -416,7 +436,7 @@
 -      cx = 0;
 -      newline();
 -    }
-+  view_cell(p % cols, p / cols, &c);
++  abs_cell(p % cols, p / cols, &c);
 +  ch = c.chars[0];
  
 -    cells[(size_t)cy * cols + cx++] = (char)c;
@@ -435,21 +455,21 @@
 -
 -  nc = width / fw;
 -  nr = height / fh;
+-
+-  if (nc < 1)
+-    nc = 1;
+-  if (nr < 1)
+-    nr = 1;
 +static unsigned long color_pixel(VTermColor c, int is_bg) {
 +  XColor xc;
 +  unsigned long key;
 +  int i;
  
--  if (nc < 1)
--    nc = 1;
--  if (nr < 1)
--    nr = 1;
+-  if (nc == cols && nr == rows)
+-    return 0;
 +  if (is_bg ? VTERM_COLOR_IS_DEFAULT_BG(&c) : VTERM_COLOR_IS_DEFAULT_FG(&c))
 +    return is_bg ? bg : fg;
  
--  if (nc == cols && nr == rows)
--    return 0;
--
 -  next = (char *)malloc((size_t)nc * nr);
 -  if (!next)
 -    return -1;
@@ -533,7 +553,24 @@
  }
  
  static int put_utf8(char *out, unsigned long c) {
-@@ -631,18 +634,611 @@
+@@ -465,7 +491,7 @@
+     return;
+ 
+   sel_range(&s, &e);
+-  buf = (char *)malloc((size_t)(e - s + 1) * 4 + (size_t)rows + 1);
++  buf = (char *)malloc((size_t)(e - s + 1) * 4 + (size_t)(e / cols - s / cols) + 2);
+   if (!buf)
+     return;
+ 
+@@ -596,6 +622,7 @@
+     *y = 0;
+   if (*y >= rows)
+     *y = rows - 1;
++  *y += vbase();
+ }
+ 
+ /* returns 1 when the event was a selection / paste event and was handled */
+@@ -654,33 +681,691 @@
    return 0;
  }
  
@@ -561,14 +598,40 @@
 +}
 +
 +static void vi_clamp(void) {
-+  if (vy >= rows)
-+    vy = rows - 1;
++  if (vy >= vtotal())
++    vy = vtotal() - 1;
 +  if (vy < 0)
 +    vy = 0;
 +  if (vx >= cols)
 +    vx = cols - 1;
 +  if (vx < 0)
 +    vx = 0;
++}
++
++static void scroll_to(int off);
++
++/* scroll the window so the vi cursor is visible */
++static void vi_follow(void) {
++  int b;
++
++  b = vbase();
++  if (vy < b)
++    scroll_to(hcount - vy);
++  else if (vy >= b + rows)
++    scroll_to(hcount - (vy - rows + 1));
++}
++
++/* the wheel moved the window: pull the vi cursor back inside it */
++static void vi_pull(void) {
++  int b;
++
++  if (vmode == VI_INPUT)
++    return;
++  b = vbase();
++  if (vy < b)
++    vy = b;
++  else if (vy >= b + rows)
++    vy = b + rows - 1;
 +}
 +
 +static void vi_pos(int p) {
@@ -606,7 +669,7 @@
 +static int word_fwd(int p, int big) {
 +  int c, end;
 +
-+  end = cols * rows - 1;
++  end = cols * vtotal() - 1;
 +  c = cls(p, big);
 +  if (c)
 +    while (p < end && p / cols == (p + 1) / cols && cls(p + 1, big) == c)
@@ -621,7 +684,7 @@
 +static int word_end(int p, int big) {
 +  int c, end;
 +
-+  end = cols * rows - 1;
++  end = cols * vtotal() - 1;
 +  if (p < end)
 +    ++p;
 +  while (p < end && cls(p, big) == 0)
@@ -684,7 +747,7 @@
 +static void vi_search(int dir) {
 +  int total, start, p, i;
 +
-+  total = cols * rows;
++  total = cols * vtotal();
 +  if (search_len < 1 || search_len > cols)
 +    return;
 +
@@ -703,7 +766,7 @@
 +  const char *q;
 +  int p, i, d, depth, total, open, close_;
 +
-+  total = cols * rows;
++  total = cols * vtotal();
 +  p = vy * cols + vx;
 +  q = cell_ch(p) ? strchr(pairs, cell_ch(p)) : NULL;
 +  if (!q)
@@ -749,8 +812,13 @@
 +}
 +
 +static void vi_enter(void) {
-+  vy = cy;
-+  vx = cx;
++  if (scroll_off) {
++    vy = vbase() + (rows - 1) / 2;
++    vx = 0;
++  } else {
++    vy = hcount + cy;
++    vx = cx;
++  }
 +  vi_clamp();
 +  set_mode(VI_NORMAL);
 +}
@@ -770,6 +838,7 @@
 +      n = vcount > 0 ? vcount : 1;
 +      for (i = 0; i < n; ++i)
 +        vi_search(search_dir);
++      vi_follow();
 +      set_mode(vmode);
 +    } else if (c == 8 || c == 127) {
 +      if (qlen > 0) {
@@ -841,6 +910,7 @@
 +      vi_find(cmd, c, n, 0);
 +    }
 +
++    vi_follow();
 +    vcount = 0;
 +    return;
 +  }
@@ -924,21 +994,21 @@
 +    pending = 'g';
 +    return;
 +  case 'G':
-+    vy = have ? vcount - 1 : rows - 1;
++    vy = have ? vcount - 1 : vtotal() - 1;
 +    vi_clamp();
 +    vx = first_nonblank(vy);
 +    break;
 +  case 'H':
-+    vy = have ? vcount - 1 : 0;
++    vy = vbase() + n - 1;
 +    vi_clamp();
 +    vx = first_nonblank(vy);
 +    break;
 +  case 'M':
-+    vy = (rows - 1) / 2;
++    vy = vbase() + (rows - 1) / 2;
 +    vx = first_nonblank(vy);
 +    break;
 +  case 'L':
-+    vy = rows - n;
++    vy = vbase() + rows - n;
 +    vi_clamp();
 +    vx = first_nonblank(vy);
 +    break;
@@ -1038,23 +1108,43 @@
 +  }
 +
 +  vi_clamp();
++  vi_follow();
 +  vcount = 0;
 +}
 +
 +
++/* 1 when something other than the shell owns the terminal: a full-screen
++ * program (alternate screen) or any foreground job (a vi clone, less, fzf).
++ * Esc belongs to that program, not to xxt's vi mode */
++static int app_has_tty(void) {
++  pid_t fg;
++
++  if (VI_ALTSCREEN_PASS && altscreen)
++    return 1;
++  fg = tcgetpgrp(ptyfd);
++  return fg > 0 && shell_pgrp > 0 && fg != shell_pgrp;
++}
++
 +static int handle_key(KeySym key, int c, unsigned int state) {
 +  unsigned int m;
++  int app;
 +
 +  m = state & (ShiftMask | ControlMask | Mod1Mask);
 +
 +  if (vmode == VI_INPUT) {
-+    if (key == VI_ENTER_KEY && m == VI_ENTER_MOD &&
-+        !(VI_ALTSCREEN_PASS && altscreen)) {
++    app = VI_ALTSCREEN_PASS && app_has_tty();
++
++    /* Esc: vi mode at the shell prompt, the program otherwise.
++     * Shift+Esc does the opposite, so both stay reachable */
++    if (key == VI_ENTER_KEY && m == VI_ENTER_MOD && !app) {
 +      vi_enter();
 +      return 1;
 +    }
 +    if (key == XK_Escape && m == VI_SEND_ESC_MOD) {
-+      paste_text("\033", 1);
++      if (app)
++        vi_enter();
++      else
++        paste_text("\033", 1);
 +      return 1;
 +    }
 +    return 0;
@@ -1134,10 +1224,15 @@
 +}
 +
 +static void vi_draw_cursor(void) {
++  int y;
++
++  y = vy - vbase();
++  if (y < 0 || y >= rows)
++    return;
 +  if (vmode == VI_NORMAL)
-+    draw_span(vy, vx, vx, bg_solid, cursor_pixel);
++    draw_span(y, vx, vx, bg_solid, cursor_pixel);
 +  else
-+    draw_span(vy, vx, vx, fg, bg);
++    draw_span(y, vx, vx, fg, bg);
  }
  
  static void draw_sel(void) {
@@ -1147,7 +1242,17 @@
    if (!sel_on)
      return;
  
-@@ -657,7 +1253,12 @@
+   sel_range(&s, &e);
+   for (y = s / cols; y <= e / cols; ++y) {
++    if (y < vbase() || y >= vbase() + rows)
++      continue;
+     x0 = y == s / cols ? s % cols : 0;
+     x1 = y == e / cols ? e % cols : cols - 1;
+-    draw_span(y, x0, x1, sel_fg, sel_bg);
++    draw_span(y - vbase(), x0, x1, sel_fg, sel_bg);
+   }
+ }
+ 
  static void draw_cursor(void) {
    int x;
  
@@ -1161,8 +1266,8 @@
      return;
  
    x = cx < cols ? cx : cols - 1;
-@@ -665,21 +1266,74 @@
-   draw_span(cy, x, x, bg_solid, cursor_pixel);
+@@ -710,21 +1395,74 @@
+   }
  }
  
 +static int put_num(char *out, int v) {
@@ -1237,13 +1342,13 @@
  
    draw_sel();
 -  draw_cursor();
-+  if (!scroll_off)
++  if (vmode != VI_INPUT || !scroll_off)
 +    draw_cursor();
 +  draw_tag();
  
    XFlush(display);
  }
-@@ -710,39 +1364,131 @@
+@@ -755,39 +1493,131 @@
               SubstructureRedirectMask | SubstructureNotifyMask, &event);
  }
  
@@ -1262,8 +1367,7 @@
 +    scroll_to(scroll_off - WHEEL_LINES);
 +    return 1;
 +  }
- 
--  seq = NULL;
++
 +  if (e->type != KeyPress)
 +    return 0;
 +
@@ -1299,7 +1403,8 @@
 +    mod = (VTermModifier)(mod | VTERM_MOD_ALT);
 +  if (state & ControlMask)
 +    mod = (VTermModifier)(mod | VTERM_MOD_CTRL);
-+
+ 
+-  seq = NULL;
 +  alt = (state & Mod1Mask) ? VTERM_MOD_ALT : VTERM_MOD_NONE;
 +  vk = VTERM_KEY_NONE;
  
@@ -1365,15 +1470,15 @@
 +    if (key >= XK_F1 && key <= XK_F12)
 +      vk = (VTermKey)VTERM_KEY_FUNCTION(key - XK_F1 + 1);
 +    break;
-+  }
-+
-+  if (vk != VTERM_KEY_NONE) {
-+    vterm_keyboard_key(vt, vk, mod);
-+    return;
    }
  
 -  strcpy(buf, seq);
 -  return (int)strlen(seq);
++  if (vk != VTERM_KEY_NONE) {
++    vterm_keyboard_key(vt, vk, mod);
++    return;
++  }
++
 +  if (n > 0) {
 +    if (state & ControlMask) {
 +      if (state & Mod1Mask)
@@ -1390,7 +1495,7 @@
  }
  
  /* clipboard keys; returns 1 when the key was consumed */
-@@ -771,7 +1517,7 @@
+@@ -816,7 +1646,7 @@
    for (fd = 0; fd < 3; ++fd)
      if (fcntl(fd, F_GETFD) == -1)
        open("/dev/null", O_RDWR);
@@ -1399,7 +1504,7 @@
    pid_t child;
    char *name, buf[READ_SIZE];
    const char *shell;
-@@ -822,11 +1568,35 @@
+@@ -869,11 +1699,35 @@
    if (rows < 1)
      rows = 1;
  
@@ -1408,13 +1513,13 @@
 +  text = (XChar2b *)malloc(sizeof *text * (size_t)cols);
 +  rowbuf = (VTermScreenCell *)malloc(sizeof *rowbuf * (size_t)cols);
 +  if (!text || !rowbuf)
-+    return 1;
-+
-+  vt = vterm_new(rows, cols);
-+  if (!vt)
      return 1;
  
 -  clear_screen();
++  vt = vterm_new(rows, cols);
++  if (!vt)
++    return 1;
++
 +  vterm_set_utf8(vt, 1);
 +  vterm_output_set_callback(vt, output, NULL);
 +
@@ -1438,7 +1543,7 @@
  
    window = create_window(width, height);
  
-@@ -899,6 +1669,7 @@
+@@ -952,6 +1806,7 @@
      close(master);
  
      setenv("TERM", TERM_NAME, 1);
@@ -1446,16 +1551,25 @@
  
      shell = getenv("SHELL");
      if (!shell)
-@@ -914,7 +1685,7 @@
+@@ -961,6 +1816,7 @@
+     _exit(1);
+   }
+ 
++  shell_pgrp = child;
+   xfd = ConnectionNumber(display);
+   blink_reset();
+ 
+@@ -968,7 +1824,8 @@
      while (XPending(display)) {
        XNextEvent(display, &event);
  
 -      if (mouse_event(&event)) {
 +      if (scroll_event(&event) || mouse_event(&event)) {
++        vi_pull();
          draw();
          continue;
        }
-@@ -935,15 +1706,17 @@
+@@ -996,15 +1853,17 @@
            continue;
          }
  
@@ -1480,7 +1594,7 @@
  
        } else if (event.type == SelectionRequest) {
          selection_request(&event.xselectionrequest);
-@@ -978,8 +1751,7 @@
+@@ -1056,8 +1915,7 @@
        if (n <= 0)
          break;
  
