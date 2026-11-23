@@ -1,4 +1,4 @@
-/* xxt - tiny fullscreen X11 terminal.
+/* xxt - tiny X11 terminal.
  * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
  */
 #define _XOPEN_SOURCE 600
@@ -435,7 +435,6 @@ int main(void) {
   XSetFont(display, gc, font->fid);
 
   XMapWindow(display, window);
-  fullscreen();
 
   master = posix_openpt(O_RDWR | O_NOCTTY);
   if (master < 0 || grantpt(master) || unlockpt(master))
