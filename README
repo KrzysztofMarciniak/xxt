@@ -14,7 +14,7 @@ tldr:
 	just the original (no patches):
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
-	smallest possible (194 lines, dumb terminal):
+	smallest possible (189 lines, dumb terminal):
 		patch main.c < patches/bare.patch
 		cc -std=c89 -o xxt main.c -lX11 -O2
 
@@ -63,7 +63,7 @@ patches:
 
 	patches/config.patch
 		moves the hard-coded settings of main.c into #defines at the top.
-		fullscreen is a switch now. no behaviour change with the defaults.
+		fullscreen is a switch now (FULLSCREEN, off by default).
 
 	patches/copypaste.patch   (needs config)
 		mouse: drag = select, double click = word, triple click = line.

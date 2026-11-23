@@ -303,26 +303,6 @@ static void draw(void) {
   XFlush(display);
 }
 
-static void fullscreen(void) {
-  Atom state, full;
-  XEvent event;
-
-  state = XInternAtom(display, "_NET_WM_STATE", False);
-  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
-
-  memset(&event, 0, sizeof event);
-  event.xclient.type = ClientMessage;
-  event.xclient.window = window;
-  event.xclient.message_type = state;
-  event.xclient.format = 32;
-  event.xclient.data.l[0] = 1;
-  event.xclient.data.l[1] = (long)full;
-  event.xclient.data.l[3] = 1;
-
-  XSendEvent(display, DefaultRootWindow(display), False,
-             SubstructureRedirectMask | SubstructureNotifyMask, &event);
-}
-
 static int special_key(KeySym key, char *buf) {
   const char *seq;
 
@@ -403,11 +383,10 @@ int main(void) {
 
   bg = color.pixel;
 
-  width = DisplayWidth(display, DefaultScreen(display));
-  height = DisplayHeight(display, DefaultScreen(display));
-
-  cols = width / fw;
-  rows = height / fh;
+  cols = 80;
+  rows = 24;
+  width = cols * fw;
+  height = rows * fh;
 
   if (cols < 1)
     cols = 1;

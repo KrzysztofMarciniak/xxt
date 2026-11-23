@@ -1,22 +1,20 @@
---- a/main.c	2026-11-17 09:34:48.603794988 +0000
-+++ b/main.c	2026-11-17 09:34:48.604847560 +0000
+--- a/main.c
++++ b/main.c
 @@ -1,4 +1,4 @@
--/* xxt - tiny fullscreen X11 terminal.
-+/* xxt bare - dumb fullscreen X11 terminal: TERM=dumb, no escapes, no resize.
+-/* xxt - tiny X11 terminal.
++/* xxt bare - dumb X11 terminal: TERM=dumb, no escapes, no resize.
   * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
   */
  #define _XOPEN_SOURCE 600
-@@ -7,8 +7,8 @@
+@@ -7,7 +7,6 @@
  #define FONT "fixed"
  #define BG_COLOR "#000000"
  #define FG_COLOR "#ffffff"
 -#define PARAM_COUNT(a) (sizeof(a) / sizeof((a)[0]))
  
-+#include <X11/Xatom.h>
  #include <X11/Xlib.h>
  #include <X11/Xutil.h>
- #include <X11/keysym.h>
-@@ -17,14 +17,10 @@
+@@ -17,14 +16,10 @@
  #include <string.h>
  #include <sys/ioctl.h>
  #include <sys/select.h>
@@ -32,7 +30,7 @@
  static Display *display;
  static Window window;
  static GC gc;
-@@ -32,18 +28,15 @@
+@@ -32,18 +27,15 @@
  static int fw, fh;
  static unsigned long fg, bg;
  
@@ -57,7 +55,7 @@
  static void newline(void) {
    if (++cy < rows)
      return;
-@@ -53,390 +46,89 @@
+@@ -53,368 +45,85 @@
    memset(cells + (size_t)(rows - 1) * cols, ' ', (size_t)cols);
  }
  
@@ -321,26 +319,6 @@
    XFlush(display);
  }
  
--static void fullscreen(void) {
--  Atom state, full;
--  XEvent event;
--
--  state = XInternAtom(display, "_NET_WM_STATE", False);
--  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
--
--  memset(&event, 0, sizeof event);
--  event.xclient.type = ClientMessage;
--  event.xclient.window = window;
--  event.xclient.message_type = state;
--  event.xclient.format = 32;
--  event.xclient.data.l[0] = 1;
--  event.xclient.data.l[1] = (long)full;
--  event.xclient.data.l[3] = 1;
--
--  XSendEvent(display, DefaultRootWindow(display), False,
--             SubstructureRedirectMask | SubstructureNotifyMask, &event);
--}
--
 -static int special_key(KeySym key, char *buf) {
 -  const char *seq;
 -
@@ -393,7 +371,6 @@
 -  Colormap cmap;
 -  XColor color;
 -  fd_set readfds;
-+  Atom full;
 +  fd_set fds;
  
    display = XOpenDisplay(NULL);
@@ -425,15 +402,12 @@
 -
 -  bg = color.pixel;
 -
--  width = DisplayWidth(display, DefaultScreen(display));
--  height = DisplayHeight(display, DefaultScreen(display));
--
 +  fg = color(FG_COLOR);
 +  bg = color(BG_COLOR);
-+  width = DisplayWidth(display, 0);
-+  height = DisplayHeight(display, 0);
-   cols = width / fw;
-   rows = height / fh;
+   cols = 80;
+   rows = 24;
+   width = cols * fw;
+   height = rows * fh;
 -
 -  if (cols < 1)
 -    cols = 1;
@@ -465,16 +439,12 @@
    gc = XCreateGC(display, window, 0, NULL);
    XSetFont(display, gc, font->fid);
  
-+  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
-+  XChangeProperty(display, window, XInternAtom(display, "_NET_WM_STATE", False),
-+                  XA_ATOM, 32, PropModeReplace, (unsigned char *)&full, 1);
    XMapWindow(display, window);
--  fullscreen();
 -
    master = posix_openpt(O_RDWR | O_NOCTTY);
    if (master < 0 || grantpt(master) || unlockpt(master))
      return 1;
-@@ -444,101 +136,59 @@
+@@ -422,101 +131,59 @@
    name = ptsname(master);
    if (!name)
      return 1;

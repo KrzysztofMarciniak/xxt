@@ -1,10 +1,6 @@
 --- a/main.c
 +++ b/main.c
-@@ -1,12 +1,32 @@
--/* xxt - tiny fullscreen X11 terminal.
-+/* xxt - tiny X11 terminal.
-  * Build: cc -std=c89 -Wall -Wextra -o xxt main.c -lX11
-  */
+@@ -4,9 +4,29 @@
  #define _XOPEN_SOURCE 600
  #define _DEFAULT_SOURCE
  
@@ -18,7 +14,7 @@
 +/* window */
 +#define WIN_TITLE "xxt"
 +#define WIN_CLASS "xxt"
-+#define FULLSCREEN 1 /* 1 = fullscreen, 0 = WIN_WIDTH x WIN_HEIGHT */
++#define FULLSCREEN 0 /* 1 = fullscreen, 0 = WIN_WIDTH x WIN_HEIGHT */
 +#define WIN_WIDTH 800
 +#define WIN_HEIGHT 600
 +
@@ -81,7 +77,7 @@
      if (cx >= cols)
        cx = cols - 1;
      break;
-@@ -281,28 +322,53 @@
+@@ -281,28 +322,73 @@
    return 0;
  }
  
@@ -141,10 +137,30 @@
 +                             bg);
 +}
 +
- static void fullscreen(void) {
-   Atom state, full;
-   XEvent event;
-@@ -365,14 +431,13 @@
++static void fullscreen(void) {
++  Atom state, full;
++  XEvent event;
++
++  state = XInternAtom(display, "_NET_WM_STATE", False);
++  full = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
++
++  memset(&event, 0, sizeof event);
++  event.xclient.type = ClientMessage;
++  event.xclient.window = window;
++  event.xclient.message_type = state;
++  event.xclient.format = 32;
++  event.xclient.data.l[0] = 1;
++  event.xclient.data.l[1] = (long)full;
++  event.xclient.data.l[3] = 1;
++
++  XSendEvent(display, DefaultRootWindow(display), False,
++             SubstructureRedirectMask | SubstructureNotifyMask, &event);
++}
++
+ static int special_key(KeySym key, char *buf) {
+   const char *seq;
+ 
+@@ -345,14 +431,13 @@
        open("/dev/null", O_RDWR);
    int master, slave, n, xfd, i, width, height;
    pid_t child;
@@ -161,7 +177,7 @@
    fd_set readfds;
  
    display = XOpenDisplay(NULL);
-@@ -391,20 +456,18 @@
+@@ -371,22 +456,21 @@
  
    cmap = DefaultColormap(display, DefaultScreen(display));
  
@@ -176,9 +192,6 @@
 -    return 1;
 -
 -  bg = color.pixel;
--
--  width = DisplayWidth(display, DefaultScreen(display));
--  height = DisplayHeight(display, DefaultScreen(display));
 +  fg = parse_color(FG_COLOR, 0);
 +  bg = parse_color(BG_COLOR, 1);
 +  bg_solid = parse_color(BG_COLOR, 0);
@@ -192,9 +205,16 @@
 +    height = WIN_HEIGHT;
 +  }
  
-   cols = width / fw;
-   rows = height / fh;
-@@ -420,11 +483,12 @@
+-  cols = 80;
+-  rows = 24;
+-  width = cols * fw;
+-  height = rows * fh;
++  cols = width / fw;
++  rows = height / fh;
+ 
+   if (cols < 1)
+     cols = 1;
+@@ -399,11 +483,12 @@
  
    clear_screen();
  
@@ -211,17 +231,16 @@
    XSelectInput(display, window,
                 KeyPressMask | ExposureMask | StructureNotifyMask);
  
-@@ -435,7 +499,8 @@
+@@ -414,6 +499,8 @@
    XSetFont(display, gc, font->fid);
  
    XMapWindow(display, window);
--  fullscreen();
 +  if (FULLSCREEN)
 +    fullscreen();
  
    master = posix_openpt(O_RDWR | O_NOCTTY);
    if (master < 0 || grantpt(master) || unlockpt(master))
-@@ -474,11 +539,11 @@
+@@ -452,11 +539,11 @@
  
      close(master);
  
@@ -235,7 +254,7 @@
  
      execl(shell, shell, (char *)0);
      _exit(1);
-@@ -502,7 +567,7 @@
+@@ -480,7 +567,7 @@
          n = XLookupString(&event.xkey, buf, sizeof buf, &key, NULL);
  
          if (key == XK_BackSpace) {
